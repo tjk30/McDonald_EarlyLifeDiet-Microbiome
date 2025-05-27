@@ -1,1 +1,8 @@
-
+microbiomeAge_infant-onlyra.csv: Fig.S4. Calculated microbiome ages for all samples. 
+FoodSeq-animal.rds: Phyloseq object containing analyzed animal FoodSeq data and sample metadata.
+FoodSeq-plant.rds: Phyloseq object containing analyzed plant FoodSeq data and sample metadata.
+Microbiome-16S.rds: Phyloseq object containing analyzed 16S sequencing data and sample metadata.
+cluster-df.csv: Fig.4. CLR transformed values for age-associated microbiome clusters.
+gordon-seqs.csv: Columns A ('RankOrder'), F ('GordonName'), and G ('GordonLab') from Supplementary Table 6 from Subramanian, S., Huq, S., Yatsunenko, T. et al. Persistent gut microbiota immaturity in malnourished Bangladeshi children. Nature 510, 417–421 (2014). https://doi-org.proxy.lib.duke.edu/10.1038/nature13421
+pc.data.all.csv: Fig.4. Principal component analysis values and metadata.
+unifrac_distance_matrix.csv: Fig.S2. Unweighted unifrac values used in PCoA.
