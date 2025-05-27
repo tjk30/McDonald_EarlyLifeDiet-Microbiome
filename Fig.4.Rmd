@@ -1,0 +1,534 @@
+---
+title: "Clean code"
+output: html_notebook
+---
+# Setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+library(conflicted)
+library(pheatmap)
+library(wesanderson)
+library(ggtreeExtra)
+library(ggtree)
+library(treeio)
+library(tidytree)
+library(ggstar)
+library(ggnewscale)
+library(TDbook)
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+
+parseGLMs=function(models) { 
+glm.results=data.frame(
+    term=character(0),
+    estimate=numeric(0),
+    std.error=numeric(0),
+    statistic=numeric(0),
+    p.value=numeric(0),
+    formula=character(0),
+    message=character(0) 
+  )
+    for (i in seq_along(models)) { 
+      output=models[[i]]
+  tidy_output=broom::tidy(output)
+  formula=formula(output)
+  tidy_output$formula=paste(deparse(formula),collapse='')
+  tidy_output
+  tidy_output$message=names(models[i])
+  glm.results=bind_rows(glm.results,tidy_output)
+    }
+return(glm.results)
+}
+
+```
+
+## Open data
+
+
+
+
+```{r}
+# file paths
+parent=getwd()
+
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+
+```
+
+```{r}
+ps.16S@sam_data$reads=sample_sums(ps.16S)
+ps.all<- ps.16S %>%
+  subset_samples(reads>5000)%>%
+   filter_taxa(function(x) sum(x > 0) > 1, prune = TRUE)  # remove taxa present in only a single sample
+
+taxdf <- ps.all@tax_table %>%
+  as.data.frame() %>%
+  mutate(
+    name = coalesce(
+      if_else(!is.na(Species), str_c(Genus, Species, sep = "_"), NA_character_),
+      Genus,
+      Family,
+      Order,
+      Phylum
+    ),
+    name = make.unique(name, sep = "_"),
+    name = name %>%
+      str_replace_all("[^[:alnum:]]", "_") %>%  # replace special characters
+      str_replace_all(" ", "_") %>%             # replace spaces 
+      str_remove("^X") %>%                      # remove leading 'X'
+      str_remove("^_")                          # remove leading underscores
+  )
+
+taxdf
+tax_table(ps.all)<-as.matrix(taxdf)
+taxa_names(ps.all)=ps.all@tax_table[,8]
+```
+
+
+## Prep data
+
+```{r}
+ps_filt <- ps.all %>%  # Remove samples that do not have any  reads 
+  # remove  samples that had <5000 reads (only 3 in dataset but unreliable 16S data)
+  subset_samples(reads>=5000 
+                 & age_months <= 36 
+                 &diarrhea%in%c('No',NA) # remove kids known to have diarrhea
+                 &(is.na(WHZ) | WHZ>=-2) # remove acutely malnourished kids (known to have immature microbiome)
+                 )%>% 
+  prune_samples(sample_sums(.) > 0, .) %>%
+  filter_taxa(function(x) sum(x > 0) > 1, prune = TRUE) # remove rare taxa (present in only 1 sample)
+
+```
+
+
+# Set analysis functions
+
+```{r}
+
+getClusters=function(ps_filt,
+                           NumClusters=10, # default 10
+                           ra_cutoff=0.005, # default relative abundance cutoff is 0.5%
+                           filePrefix='' 
+) {
+  ps_filt.ra <- transform_sample_counts(ps_filt, function(x){x/sum(x)})
+  otu.df=ps_filt.ra@otu_table%>%
+  data.frame()%>%
+  rownames_to_column()%>%
+  pivot_longer(-rowname,names_to='name',values_to='ra')%>%
+  merge(data.frame(ps_filt.ra@sam_data)%>%select(age_months,country),by.x='rowname',by.y=0,all.x=TRUE)
+otu.df
+
+otu.df.by.age=otu.df%>%
+  mutate(age_bin=case_when(age_months<=2 ~ 1,
+                           between(age_months,2,4) ~ 3,
+                           between(age_months,5,7) ~ 6,
+                           between(age_months,8,10)~9,
+                           between(age_months,11,13)~12,
+                           between(age_months,14,16)~15,
+                           between(age_months,17,19)~18,
+                           between(age_months,20,22)~21,
+                           between(age_months,23,25)~24,
+                           age_months>25 ~ 36
+                           ))%>%
+  group_by(age_bin,name)%>%
+  summarise(avg_ra=mean(ra))
+otu.df.by.age
+
+plotme=otu.df.by.age%>%
+  pivot_wider(names_from='age_bin',values_from = 'avg_ra')%>%
+  column_to_rownames(var='name')
+plotme$country=NULL
+plotme=plotme[ , order(as.numeric(names((plotme))))]
+
+
+# Step 1: Calculate the variance for each row
+row_variances <- apply(plotme, 1, var)
+
+# Step 2: Order the dataframe by decreasing row variances
+plotme <- plotme[order(-row_variances), ]
+plotme
+
+rowmax=apply(plotme, 1, max)
+nonZeroIndices <- which(rowmax >= ra_cutoff) # there is at least 1 age bin with x prevalence of taxon
+data_matrix=plotme[nonZeroIndices, ]
+row_z_scores <- t(apply(data_matrix, 1, function(x) (x - mean(x)) / sd(x)))
+
+# Convert back to a data frame or matrix with the original column names
+row_z_scores_df <- as.data.frame(row_z_scores)
+colnames(row_z_scores_df) <- colnames(data_matrix)
+row_z_scores_df
+
+dist_matrix <- dist(row_z_scores_df) # t() transposes the matrix for row-wise clustering
+hc <- hclust(dist_matrix, method = "average")
+plot(hc)
+# Step 2: Cut the dendrogram to form clusters
+
+clusters <- data.frame(cutree(hc, k = NumClusters))
+colnames(clusters)=c('Cluster')
+
+df_cluster=clusters%>%
+  rownames_to_column(var='Feature')%>%
+  mutate(Feature=gsub("^X","",Feature))%>%
+  mutate(Feature=gsub("^_","",Feature))
+
+df_cluster
+
+plot=pheatmap(plotme[nonZeroIndices, ], 
+         cutree_rows = NumClusters, 
+         show_colnames = TRUE, 
+         cluster_cols  = FALSE,
+         annotation_names_row = FALSE,
+         annotation_row=df_cluster%>%column_to_rownames(var='Feature')%>%mutate(Cluster=factor(Cluster)),
+         clustering_method='average',
+         scale='row',
+         color = colorRampPalette(c("#0B3954",
+                                    "#A0C1B9",
+                                    "#F4E8C1"))(100),
+         angle_col = 0)
+print(plot)
+  return(df_cluster)
+}
+```
+
+```{r}
+ps.for.merging=ps_filt
+getClusterAbundances=function(df_cluster, # data frame with column labeled "Feature" with taxa names and "Cluster" with cluster assignment
+                              ps.for.merging) {
+physeq=ps.for.merging
+df_counts=data.frame(ps.for.merging@otu_table)
+colnames(df_counts)=gsub("^X","",colnames(df_counts))
+
+cluster_taxa_list <- split(df_cluster$Feature, df_cluster$Cluster)
+
+# Iterate over each cluster and merge taxa 
+for (cluster in names(cluster_taxa_list)) {
+  taxa_to_merge <- cluster_taxa_list[[cluster]]
+    physeq <- merge_taxa(physeq, taxa_to_merge)
+    taxa_names(physeq)[taxa_names(physeq)%in%taxa_to_merge]=paste0('cluster',cluster)
+}
+
+physeq.clr=microbiome::transform(physeq, 'clr') 
+df=data.frame(physeq.clr@otu_table)[,grepl('cluster',colnames(data.frame(physeq.clr@otu_table)))]
+df
+return(df)
+}
+```
+
+
+
+# Generate clusters
+```{r,fig.height=10}
+df_cluster=getClusters(ps_filt,
+                       filePrefix = '',
+                       ra_cutoff=0.005)
+```
+
+## Calculate cluster abundances
+
+```{r}
+data=getClusterAbundances(df_cluster,
+                          ps.all)
+data
+```
+```{r}
+cluster.mapping=data.frame(Cluster=c(4,3,6,10,2,8,9,5,1,7), # relabel to match heatmap
+                           name_ordered=c(seq(1:10)))%>%
+  mutate(oldname=paste0('cluster',Cluster),
+         newname=paste0('cluster',name_ordered))%>%
+  select(oldname,newname)
+cluster.mapping
+numeric_cols <- data %>% select(where(is.numeric))%>%colnames(.)
+
+data_renamed=data%>%
+  t()%>%
+  data.frame()%>%
+  rownames_to_column(var='oldname')%>%
+  left_join(cluster.mapping,by='oldname')%>%
+  mutate(newname=ifelse(is.na(newname),oldname,newname))%>%
+  column_to_rownames(var='newname')%>%
+  select(-oldname)%>%
+  t()%>%
+  data.frame()%>%
+  mutate(across(all_of(numeric_cols), as.double)) # transform everything back to numeric
+data_renamed
+write.csv(data_renamed,'cluster-df.csv')
+```
+# 4a) Clusters over time
+
+
+```{r}
+ps.16s.glom=ps_filt
+df_counts=data.frame(ps_filt@otu_table)
+colnames(df_counts)=gsub("^X","",colnames(df_counts))
+
+cluster_taxa_list <- split(df_cluster$Feature, df_cluster$Cluster)
+
+# Iterate over each cluster and merge taxa 
+for (cluster in names(cluster_taxa_list)) {
+  taxa_to_merge <- cluster_taxa_list[[cluster]]
+    ps.16s.glom <- merge_taxa(ps.16s.glom, taxa_to_merge)
+    taxa_names(ps.16s.glom)[taxa_names(ps.16s.glom)%in%taxa_to_merge]=paste0('cluster',cluster)
+}
+```
+
+```{r}
+data=ps.16s.glom@otu_table%>%
+  data.frame()%>%
+  rownames_to_column(var='match')%>%
+  pivot_longer(-match)%>%
+  left_join(data.frame(ps.16s.glom@sam_data)%>%rownames_to_column(var='match')%>%select(match,country,age_months,reads),by='match')%>%
+  mutate(age_bin=case_when(age_months<=2 ~ '0-2mo',
+                           between(age_months,2,4) ~ '2-4mo',
+                           between(age_months,5,7) ~ '5-7mo',
+                           between(age_months,8,10)~'8-10mo',
+                           between(age_months,11,13)~'11-13mo',
+                           between(age_months,14,16)~'14-16mo',
+                           between(age_months,17,19)~'17-19mo',
+                           between(age_months,20,22)~'20-22',
+                           between(age_months,23,25)~'23-25',
+                           age_months>25 ~ '>25mo'
+                           ))
+
+taxdf=data.frame(ps.16s.glom@tax_table)%>%select(-name)%>%rownames_to_column(var='name')
+taxdf
+cluster.mapping=data.frame(Cluster=c(4,3,6,10,2,8,9,5,1,7),
+                           label=c(seq(1:10)))%>%
+  mutate(name=paste0('cluster',Cluster))
+
+data1=data%>%
+  left_join(taxdf,by='name')%>%
+  left_join(cluster.mapping,by='name')%>%
+  mutate(is.cluster=case_when(Cluster==1 ~ 'Early Microbiome\n(Bifidobacterium-Streptococcus)',
+                              Cluster==2 ~ 'Late Microbiome\n(Prevotella-Faecalibacterium)',
+                              Cluster==4 ~ 'Transitional Microbiome\n(Blautia-Ruminococcus)',
+                            Cluster%in%c(3,5,6,7,8,9,10,NA) ~ ''))%>%
+  mutate(is.cluster=factor(is.cluster,levels=c('','Early Microbiome\n(Bifidobacterium-Streptococcus)','Transitional Microbiome\n(Blautia-Ruminococcus)','Late Microbiome\n(Prevotella-Faecalibacterium)')),
+         age_bin=factor(age_bin,levels=c('0-2mo', '2-4mo', '5-7mo', '8-10mo', '11-13mo', '14-16mo', '17-19mo', '20-22', '23-25', '>25mo')
+))%>%
+  group_by(match,is.cluster,country,age_bin)%>%
+  summarise(value=sum(value),
+            reads=reads)%>%
+  mutate(ra=value/reads) # calculate relative abundance within each age bin
+data1
+
+```
+
+```{r,fig.width=8.5,fig.height=3.2}
+plot=data1%>%
+  group_by(age_bin,is.cluster)%>%
+  summarise(avgRA=mean(ra))%>%
+  ggplot(aes(x=age_bin,y=avgRA,fill = is.cluster))+
+  geom_col(colour=NA)+
+  labs(fill='Cluster',x='Age (Months)',y='Relative abundance')+
+  scale_fill_manual(
+  values = c("white", met.brewer("Derain", n = 4)[c(1,2,4)])
+)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+theme(
+      text=element_text(family = "Arial",size=12,face='bold'),
+      axis.title = element_text(family = "Arial",size=18,face='bold'),
+      axis.text = element_text(family = "Arial",size=12,face='plain'),
+    legend.position = 'none',
+    panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(),
+ panel.background = element_rect(fill = "white", color = NA), 
+  panel.border = element_rect(color = "grey", fill = NA)     
+    )
+plot
+ggsave('MbClusters-by-age-barplot.png',
+       width=8.5,
+       height=3.2)
+```
+
+```{r,fig.width=14,fig.height=4}
+plot+
+theme(
+      text=element_text(family = "Arial",size=20,face='bold'),
+    legend.position = 'bottom'
+    )+guides(
+  fill = guide_legend(
+    override.aes = list(size = 10)  # size of points in the legend
+  ))
+
+ggsave('cluster-annotation.png',
+       width=14,
+       height=4)
+```
+
+# 4b-4e) pFR vs clusters
+## Prep data
+### Retrieve PC data
+
+```{r}
+ps=ps.trnL%>%
+  subset_samples(age_months<=47) %>% # include 3yo older than 36mo
+  prune_samples(sample_sums(.) > 0, .) %>% # Remove samples that do not have any food reads x
+  microbiome::transform(., 'clr') %>% # normalize
+  subset_taxa(., !is.na(superkingdom)) # remove non-foods 
+
+p=pcaPlot(ps,'country','Country',10)+scale_color_manual(values=met.brewer('Hiroshige',5)) 
+
+pc.data=pcData(ps,p,nPCs=3)%>%
+  select(name,c(starts_with('PC',ignore.case=FALSE))) %>%
+  column_to_rownames(var='name')
+colnames(pc.data)=paste0(colnames(pc.data),'_trnL')
+pc.data.all=pc.data%>%
+  merge(data.frame(ps.trnL@sam_data),by=0)%>%
+  column_to_rownames(var='Row.names')
+pc.data.all
+write.csv(pc.data.all,'pc.data.all.csv')
+```
+### Open cluster data
+
+```{r}
+
+data_renamed=read.csv('cluster-df.csv',row.names = 1)
+data_all=read.csv('pc.data.all.csv',row.names = 1)%>%
+  rownames_to_column()%>%
+  mutate(rowname=gsub('-|_| ','\\.',rowname))%>% # synchronize rownames for merging
+  column_to_rownames()%>%
+  merge(data_renamed,by=0,all.x=TRUE)%>%
+  column_to_rownames(var='Row.names')
+data_all
+```
+
+
+### Define plotting function
+```{r}
+plotGLM=function(cluster,
+                 data,
+                 var,
+                 var_name='',
+                 cluster_name='Cluster'
+                 ) {
+
+  # Fit GLM
+  formula <- as.formula(paste0(cluster, " ~ age_months + country + country:age_months + ",
+                               var, " + country:", var, " + age_months:", var)) # model used for all global tests
+  model <- glm(formula, data = data, family = "gaussian")
+
+  res <- parseGLMs(list(model))  
+
+  results_df <- tibble(
+    intercept = res$estimate[res$term == "(Intercept)"],
+    slope_var = res$estimate[res$term == var],
+    p_value_var = res$p.value[res$term == var],
+    p_value_age_months = res$p.value[res$term == "age_months"]
+  )
+
+  # Generate predicted line data
+  x_vals <- seq(min(data[[var]]), max(data[[var]]), by = 1)
+  line_data <- tibble(x = x_vals) %>%
+    mutate(y_value = results_df$intercept + results_df$slope_var * x,
+           Variable = var_name)  
+
+  # Build main data for plotting
+  d <- data %>%
+    select(var = all_of(var), cluster = all_of(cluster), age_months = age_percentile)
+
+  # Build p-value annotation
+  var.p <- results_df$p_value_var
+  cap <- case_when(var.p >= 0.1 ~ 'NS',
+                  var.p < 0.1 & var.p >= 0.05~ ".",
+                  var.p < 0.05 & var.p >= 0.01~ "*",
+                  var.p < 0.01 & var.p >= 0.001~ "**",
+                  var.p < 0.001 ~ "***")
+
+  # Plot
+  plot <- ggplot(d, aes(x = var, y = cluster)) +
+    geom_point(aes(color = age_months), size = 2) +
+    geom_line(data = line_data, aes(x = x, y = y_value), size = 1) +
+    scale_color_gradientn(
+      limits = r, colours = colours[c(1, seq_along(colours), length(colours))],
+      breaks = breaks, labels = labels,
+      values = c(0, scales::rescale(breaks, from = r), 1)
+    ) +
+    labs(
+      x = var_name,
+      y = "Cluster Abundance\n(clr transformed counts)",
+      color = "Age (months)",
+      title = cluster_name
+    ) +
+    annotate("text", label = cap, x = Inf, y = -Inf,
+             hjust = 1.1, vjust = -2, size = 6, fontface = "bold", family = "Arial") +
+    theme_bw() +
+    theme(
+      strip.background = element_rect(fill = "white"),
+      text = element_text(family = "Arial", size = 20, face = "bold"),
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5)
+    )
+print(plot)
+ return(plot)
+}
+```
+
+### Prepare data for plotting
+```{r}
+
+# Filter and prepare data
+data <- data_all %>%
+  filter(!is.na(pFR)) %>%
+  mutate(age_percentile = ifelse(age_months<24, age_months/24, 30/24))
+
+# Define interpolation for age scale
+specific_values <- c(0, 6, 12, 18, 24)
+interp <- approx(data$age_months, data$age_percentile, xout = specific_values)
+breaks <- interp$y
+labels <- interp$x
+colours <- met.brewer("Hiroshige", length(breaks))
+r <- range(data$age_percentile)
+
+# Cluster mapping
+cluster.names <- c("cluster9" = "Early Microbiome",
+                   "cluster5" = "Late Microbiome",
+                   "cluster1" = "Transitional Microbiome")
+```
+## 4b) Early microbiome vs. pFR
+```{r}
+plot=plotGLM(cluster='cluster9',data=data,var='pFR',var_name='pFR',cluster_name='Early Microbiome')
+plot
+ ggsave(
+    filename = "EarlyMicrobiome_vs_pFR.png",
+    plot = plot, width = 5, height = 5
+  )
+```
+## 4c) Transitional microbiome vs. pFR
+```{r}
+plot=plotGLM(cluster='cluster1',data=data,var='pFR',var_name='pFR',cluster_name='Transitional Microbiome')
+plot
+ ggsave(
+    filename = "TransitionalMicrobiome_vs_pFR.png",
+    plot = plot, width = 5, height = 5
+  )
+```
+## 4d) Late microbiome vs. pFR
+```{r}
+plot=plotGLM(cluster='cluster5',data=data,var='pFR',var_name='pFR',cluster_name='Late Microbiome')
+plot
+ ggsave(
+    filename = "LateMicrobiome_vs_pFR.png",
+    plot = plot, width = 5, height = 5
+  )
+```
+## 4e) Late microbiome vs. PC1
+```{r}
+plot=plotGLM(cluster='cluster5',data=data,var='PC1_trnL',var_name='PC1',cluster_name='Late Microbiome')
+plot
+ ggsave(
+    filename = "LateMicrobiome_vs_PC1.png",
+    plot = plot, width = 5, height = 5
+  )
+```
+

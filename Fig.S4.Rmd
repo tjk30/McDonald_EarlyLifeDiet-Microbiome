@@ -1,0 +1,1079 @@
+---
+title: "16s ml infant analysis"
+output: html_notebook
+---
+# setup
+```{r}
+library(tidyverse)
+library(phyloseq)
+library(MetBrewer)
+library(dada2)
+library(tidytext)
+library(VennDiagram)
+library(pheatmap)
+
+```
+# run ML
+
+## Rscript
+```{r}
+##### Imports
+library(caret)
+library(MLmetrics)
+library(dada2)
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(here)
+library(reshape2) 
+library(microbiome)
+library(pdp) 
+library(pROC)
+library(randomForest)
+
+
+##### Functions
+
+phyloseqPCA_ML <- function(train, test, numOTUColumns, center = TRUE, scale = FALSE){
+  
+  # copy train and test - these will be the output versions that have PCA transformed data
+  train.pca <- train
+  test.pca <- test
+  
+  # pull out the OTUs from the training set
+  trainOTUs <- train[,1:numOTUColumns]
+  testOTUs <- test[,1:numOTUColumns]
+  
+  # PCA
+  pca <- prcomp(trainOTUs, center = center, scale = scale)
+  
+  
+  trainOTUs.PCA <- data.frame(pca$x) 
+  testOTUs.PCA <- data.frame(predict(pca, newdata = testOTUs)) 
+  
+  train.pca[,1:numOTUColumns] <- trainOTUs.PCA
+  test.pca[,1:numOTUColumns] <- testOTUs.PCA
+  
+  # update column names
+  colnames(train.pca)[1:numOTUColumns] <- colnames(trainOTUs.PCA)
+  colnames(test.pca)[1:numOTUColumns] <- colnames(testOTUs.PCA)
+  
+  
+  return(list(train = train.pca, test = test.pca))
+}
+
+
+# ps: phyloseq object
+# outcomeData: outcome variables for model to predict
+rf_trnL_pipeline <- function(ps, outcomeVariables,samplesToRemove=c(), nonOTUPredictors = c(), multiClassPredictors = c(), trainIndices = NULL, iterations = 100, trainProportion = 0.8, modelType = "rf",correlationType = "spearman", title = "", runPCA = FALSE, center = TRUE, scale = TRUE, featureSelection = FALSE, plotImportances = FALSE, plotPDP = FALSE, plotResult = FALSE, saveImportances = FALSE, outDir = "", saveImportancePlots = FALSE, savePredictions = FALSE){
+  
+  # pull the data from the phyloseq object
+  inputData <- ps@otu_table
+  
+  
+  # pull out sample data frame from ps object
+  samdf <- data.frame(ps@sam_data) %>% 
+    rownames_to_column(var = 'name')
+  sampleVariables <- colnames(samdf)
+  inputData <- inputData %>% 
+    as.data.frame()  %>% 
+    rownames_to_column(var = 'name') %>% 
+    left_join(., samdf, by = "name") 
+  # add rowname back
+  rownames(inputData) <- inputData$name
+  
+  
+  
+  # Throw out sample variables we don't need (things that are not the specified outcome variables) and keep subj
+  inputData <- select(inputData, -sampleVariables[!(sampleVariables %in% outcomeVariables) & sampleVariables != "subj" & !(sampleVariables %in% nonOTUPredictors)])
+  
+  
+  print("Running models with true data...")
+  #   # TODO: Fix the model parameters here 
+  correlationResults <- rf_continuous(inputData, outcomeVariables, ps, nonOTUPredictors = nonOTUPredictors, multiClassPredictors = multiClassPredictors, title = title, trainIndices= trainIndices,
+                                      iterations = iterations, trainProportion = trainProportion, modelType =
+                                        "rf",correlationType = correlationType, plotResult = plotResult,
+                                      plotImportances = plotImportances, plotPDP = plotPDP, shuffle = FALSE, runPCA = runPCA, center = center, 
+                                      scale = scale, saveImportances = saveImportances, outDir = outDir, saveImportancePlots = saveImportancePlots,
+                                      savePredictions = savePredictions)
+  
+  # run RF with randomly shuffled data - shuffle within outcome variables
+  print("Running models with shuffled data...")
+  
+  # TODO: Fix the model parameters here 
+  correlationResultsShuffled <- rf_continuous(inputData, outcomeVariables, ps, nonOTUPredictors = nonOTUPredictors, multiClassPredictors = multiClassPredictors, title = title, trainIndices= trainIndices, 
+                                              iterations = iterations, trainProportion = trainProportion, modelType = "rf",
+                                              correlationType = correlationType, plotResult = FALSE, plotPDP = FALSE, shuffle = TRUE, runPCA = runPCA, center = center, scale = scale)
+  
+  return(list(true = correlationResults, shuff = correlationResultsShuffled))
+}
+
+# train/test split based box plotting of correlations
+# data: dataframe of samples x features. Features include the variables you want to predict
+# variables: variables that you want to predict using the OTU data
+# iterations: number of different iterations to run of the splitting
+# trainProportion: proportion of samples to use for training
+rf_continuous <- function(data, outcomeVariables, ps, samplesToRemove=c(),nonOTUPredictors = c(), multiClassPredictors = c(), title= "", trainIndices = NULL, iterations = 100, trainProportion = 0.8, correlationType = "pearson", modelType = "rf", plotResult = TRUE, center = TRUE, scale = TRUE, plotImportances = FALSE, plotPDP = FALSE, shuffle = FALSE, runPCA = FALSE, saveImportances = FALSE, outDir = "", saveImportancePlots = FALSE, savePredictions = FALSE){
+  
+  correlationDf <- data.frame()
+  
+  # change the column names of unknown trnL data sequences to be unique
+  numUnknowns <- sum(colnames(data) == "NA.NA.")
+  colnames(data)[(colnames(data) == "NA.NA.")] <- sprintf("UnknownNumber%s",seq(1:numUnknowns))
+  
+  pb <- txtProgressBar(min=0,max=1, initial = 0, style=3)
+  count <- 0
+  
+  if(savePredictions){
+    predictionsDf <- data.frame()
+  }
+  
+  for(variable in outcomeVariables){
+    # remove all variables we don't care about for this particular model
+    
+    currentData <- data %>% 
+      select(-outcomeVariables[outcomeVariables != variable])
+    
+    # filter out samples which don't have the variable's data
+    currentData <- currentData[complete.cases(currentData[,variable]), ]
+    # remove samples that aren't being used in training
+    currentData.samplesToRemove=currentData%>% subset(row.names(.)%in%samplesToRemove) # save for test set
+    currentData=currentData%>% subset(!row.names(.)%in%samplesToRemove) 
+    
+    trainSize <- trainProportion*nrow(currentData) # make sure training split is chosen correctly from the training set of data
+    
+    f <- as.formula(paste0(variable, " ~ ."))
+    
+    correlations <- c()
+    importanceDf <- data.frame()
+    
+    for(i in 1:iterations){
+      # update progress
+      setTxtProgressBar(pb, count/length(outcomeVariables)/iterations)
+      
+      # TODO: would it make more sense to shuffle subject identity? So that subject structure of the data is maintained - maybe this could be a subtest...
+      
+      if(shuffle){
+        currentData[,variable] <- currentData[,variable][shuffle(length(currentData[,variable]))]
+      }
+      # Create training and test splits on the data
+      trainInd <- vector()
+      
+      # assign trainInd randomly or use the user-supplied indices
+      if(is.null(trainIndices)){
+        
+        # ensure all of a subject's samples are in train or test split
+        subjects <- currentData$subj %>% 
+          unique()
+        subjects <- subjects[shuffle(length(subjects))]# randomly shuffle samples to try different splits
+        countInTraining <- 0
+        for (subject in subjects){
+          numSamplesPerSubject <- (table(currentData$subj))[subject] %>% 
+            as.numeric()
+          
+          if ((numSamplesPerSubject + countInTraining) < trainSize){ # if adding all of this subject's samples to the training set does not exceed the training set size then add it
+            # insert this subject's indices into the train list
+            trainInd <- trainInd %>% 
+              append(which(currentData$subj == subject))
+            countInTraining <- countInTraining + numSamplesPerSubject
+          }
+        }
+        
+        
+        # trainInd <- sample(seq(0,nrow(currentData)), trainSize)
+      } else{
+        trainInd <- trainIndices
+      }
+      
+      
+      # split data into a test and training set
+      train <- currentData[trainInd,] 
+      test <- currentData[-trainInd,] %>%
+        bind_rows(currentData.samplesToRemove) # add in the held out samples
+      
+      # remove subject from the dataset
+      train <- train %>% select(-subj)
+      test <- test %>% select(-subj)
+      
+      
+      # Run PCA on training set here if specified
+      if(runPCA){
+        # OTU columns are the first n columns where n = total columns - nonOTUPredictors - the one outcome variable
+        numOTUColumns <- ncol(train)-length(nonOTUPredictors)-1
+        pca.df <- phyloseqPCA_ML(train, test, numOTUColumns, center = center, scale = scale)
+        train <- pca.df$train
+        test <- pca.df$test
+      }
+      
+      # Train the model 
+      # for now use 10-fold CV to do HP tuning
+      fitControl <- trainControl(method = "CV", # can try changing this around in the future
+                                 number = 5)
+      rf <- train(f, data = train,
+                  method = modelType,
+                  trControl = fitControl,
+                  verbose = FALSE)
+      
+      
+      
+      # predict on the test set and evaluate predictions
+      pred <- predict(rf, newdata = test)
+      estimate <- cor.test(pred, test[,variable], method = correlationType)
+      estimate <- estimate$estimate %>%  as.numeric() # pull out only the estimate
+      
+      # store predictions
+      if(savePredictions){
+        newPredictionRows <- data.frame(sample = names(pred), prediction = pred, iteration = i)
+        predictionsDf <- rbind(predictionsDf, newPredictionRows)
+      }
+      
+      # If the correlation is pearson then calculate the R^2 value
+      if (correlationType == "pearson"){
+        correlations <- append(correlations, estimate^2)
+      }
+      else{
+        correlations <- append(correlations, estimate)
+      }
+      # Store the scaled importance values
+      importances <- varImp(rf)$importance %>% 
+        as.matrix %>% 
+        t()
+      
+      # compile importances across iterations
+      importanceDf <- rbind(importanceDf, importances)
+      
+      
+      # update count variable
+      count <- count + 1
+    }
+    
+    
+    
+    # store correlations in the master correlation df
+    newCorrelationColumn <- correlations %>% 
+      as.matrix() %>%
+      t() %>%
+      data.frame()
+    rownames(newCorrelationColumn) <- variable
+    correlationDf <- rbind(correlationDf, newCorrelationColumn)
+    plotImportancesFn(importanceDf, ps, multiClassPredictors = multiClassPredictors, model = rf, 
+                      plant=variable,
+                      title = variable, plotImportances = plotImportances, plotPDP = plotPDP, pcaUsed = runPCA, saveOutput = saveImportancePlots, outDir = outDir)
+    
+    
+    
+    if(saveImportances){
+      write.csv(importanceDf, file = file.path(outDir, paste0("importanceDf_", variable, "_", gsub(':| ','',sub(' ','_',Sys.time())),'.csv')))
+    }
+  }
+  
+  
+  if(plotResult){
+    # plot the resulting data into a box plot
+    if(correlationType == "pearson"){
+      p <- ggplot(melt(t(correlationDf)), aes(y = value, x = variable)) +
+        geom_boxplot() +
+        labs(x = "Outcome Variable", y = "R-Squared", title = title) + 
+        ylim(0,1)
+      print(p)
+      
+    }
+    else{
+      p <- ggplot(melt(t(correlationDf)), aes(y = value, x = variable)) +
+        geom_boxplot() +
+        labs(x = "Outcome Variable", y = "Spearman's Correlation", title = title) + 
+        ylim(-1,1)
+      print(p)
+    }
+    
+    
+  }
+  
+  if(savePredictions){
+    saveRDS(predictionsDf, file = file.path(outDir, paste0(Sys.time(),"-predictionsDf.rds")))
+  }
+  
+  # transpose final result so it is compatible with the t.test code. Need columns to be variables and rows to be iterations
+  return(list(correlations  = correlationDf %>% t()))
+}
+plotImportancesFn <- function(importanceDf, ps, multiClassPredictors = c(), model = NULL, 
+                              plant, 
+                              title, topN = 10, plotImportances = TRUE, plotPDP = TRUE, pcaUsed = FALSE, saveOutput = FALSE, outDir = ""){
+  # calculate average importance across runs and then sort the data
+  avgImportances <- importanceDf %>% 
+    colMeans() %>% 
+    sort(decreasing = TRUE) %>%
+    .[1:topN] # select top 10 features
+  
+  pdpVarsToPredict <- names(avgImportances)
+  
+  # remove any multi class predictors - replace with the original variable name so PDP runs correctly 
+  for (multiClassPredictor in multiClassPredictors){
+    matchedVariables <- grepl(multiClassPredictor, pdpVarsToPredict)
+    if(any(matchedVariables)){
+      pdpVarsToPredict <- pdpVarsToPredict[!matchedVariables]
+      # add the predictor back in - this time just specifying the original variable name, not the linked name and value
+      pdpVarsToPredict <- append(pdpVarsToPredict, multiClassPredictor)
+    }
+    
+  }
+  
+  # gather names for the top features using the phyloseq object only if PCA was not used - if PCA was used then just use PCA labels
+  if(pcaUsed){
+    df <- data.frame(feature = names(avgImportances), importance = avgImportances)
+    df <- importanceDf[, names(avgImportances)] %>% 
+      melt()
+    # df$variable <- factor(df$variable, levels = names(avgImportances))
+    pdpNames <- pdpVarsToPredict
+    
+  }else{
+    df <- importanceDf[, names(avgImportances)] 
+    pdpNames <- pdpVarsToPredict
+    importanceNames <- c() # these are the names for the importance plot... slightly different order than the pdp plots, since for multiclass predictors we have those at the end
+    for(predictor in colnames(df)){
+      if(predictor %in% rownames(ps@tax_table)){
+        newName <- ps@tax_table[predictor, "name"]
+        importanceNames <- append(importanceNames, newName)
+        pdpNames[pdpNames==predictor] <- newName
+      } else{
+        importanceNames <- append(importanceNames, predictor)
+      }
+    }
+    colnames(df) <- importanceNames
+    df <- df %>% 
+      melt()
+  }
+  
+  
+  importance.plot <- ggplot(df, aes(x=value, y=reorder(variable, value, FUN = median))) +
+    geom_boxplot() +
+    theme_bw() +
+    labs(x="Importance", y=NULL, title = title) +
+    theme(axis.text.y=element_text(size=6))
+  if(plotImportances){
+    print('not printing plot: will cause error on DCC')
+  }
+  if(saveOutput){
+    write.csv(melt(importanceDf), file = file.path(outDir, paste0("importanceDf_", 
+                                                                  plant, 
+                                                                  "_", gsub(':| ','',sub(' ','_',Sys.time())),'.csv')))
+  }
+  
+  
+  
+  # plot the partial dependency plots
+  for (i in seq(1,length(pdpVarsToPredict))){
+    pdp.plot <- partial(model, pred.var = pdpVarsToPredict[i], plot = TRUE,
+                        plot.engine = "ggplot2") +
+      labs(title =paste0("Rank ",i, " - ", pdpNames[i]), y = title) + theme_bw()
+    if(plotPDP){
+      print('not plotting pdp: will cause error on DCC')
+    }
+    if(saveOutput){
+      ggsave(filename = file.path(outDir, paste0("pdpPlot_", title, "_", pdpNames[i],"_", gsub(':| ','',sub(' ','_',Sys.time())), ".png")), plot = pdp.plot)
+    }
+  }
+  
+  
+}
+
+
+plotImportancesFnMulticlass <- function(importanceDf, ps, model = NULL, title, topN = 5, plotImportances = TRUE, plotPDP = TRUE, pcaUsed = FALSE, saveOutput = FALSE, outDir = ""){
+  # calculate average importance across runs and then sort the data
+  # Importance matrix is 3D: (class, predictors, iterations)
+  avgImportances <- importanceDf %>% 
+    apply(c(1,2), mean) %>% 
+    data.frame()
+  
+  # Select topN columns for each class in the importance df
+  topNColumns <- apply(avgImportances, 1, function(x) names(x[order(x, decreasing = TRUE)])[1:topN]) %>% 
+    as.character() %>% 
+    unique()
+  
+  # isolate the top features from the dataset then melt into a 2D dataframe for plotting
+  filteredImportances <- importanceDf[,topNColumns,] %>% 
+    melt(varnames = c("class", "feature", "iteration"))
+  
+  # gather the names to enter into pdp 
+  # TODO Need to handle PCA names here... this would break otherwise
+  if(pcaUsed){
+    # TODO check to see how many PCs would be generated based on the length of the otu table then auto generate names that way
+    pdpNames <- topNColumns
+    #   paste0("PC",seq(1, dim(ps@otu_table)[2] -1))
+    # pdpNames <- append(pdpNames, dimnames(importanceDf)[2][(dim(ps@otu_table)[2]-1):ncol(importanceDf)]) # append the non-otu predictors, these will be any columns that occur after the otu table
+  } else{
+    taxTableNames <- make.names(ps@tax_table[colnames(ps@otu_table), "name"])
+    pdpNames <- lapply(topNColumns, FUN = function(x) which(x==taxTableNames)) %>%  
+      as.numeric()
+    # remove NAs - these are the predictors that are not OTUS
+    pdpNames <- pdpNames[!is.na(pdpNames)]
+    pdpNames <-  rownames(ps@tax_table)[pdpNames] %>% 
+      append(topNColumns[!(topNColumns %in% taxTableNames)]) # add in any leftover columns - these would be non otu predictors
+    # TODO this will break down completely, since any additional variables that are not otus will be outside the range of the colnames list
+    
+  }
+  
+  importance.plot <- ggplot(filteredImportances, aes(x=value, y=feature, color = class)) +
+    geom_boxplot() +
+    theme_bw() +
+    labs(x="Importance", y=NULL, title = title, legend = "Class") +
+    theme(axis.text.y=element_text(size=6))
+  
+  if(plotImportances){
+    print('not plotting importances on DCC')
+  }
+  if(saveOutput){
+    write.csv(filteredImportances, file = file.path(outDir, paste0("filteredImportances", variable, "_", gsub(':| ','',sub(' ','_',Sys.time())),'.csv')))
+  }
+  
+  
+  # plot the partial dependency plots
+  
+  # prediction function - takes in rf object and new data then outputs the mean prediction for each class
+  pfun <- function(object, newdata) {
+    colMeans(predict(object, newdata = newdata, type = "prob"))
+  }
+  for (i in seq(1,length(topNColumns))){
+    # generate the pdp plot data
+    p <- partial(model, pred.var =pdpNames[i], pred.fun = pfun)
+    
+    pdp.plot <- ggplot(p, aes(!!sym(pdpNames[i]), yhat, color = yhat.id)) +
+      geom_line() +
+      theme(legend.title = element_blank()) +
+      labs(title =topNColumns[i], y = title)
+    if(plotPDP){
+      print(pdp.plot)
+    }
+    
+    if(saveOutput){
+      ggsave(filename = file.path(outDir, paste0("pdpPlot_", title, "_", topNColumns[i],"_", Sys.time(), ".png")), plot = pdp.plot)
+    }
+  }
+  
+  
+  
+}
+
+
+
+##### Data Preparation 
+
+data.dir<-'./machine-learning/RF-16S'
+
+ps.all<- file.path(data.dir,
+		   '..',
+		   'Microbiome-16S.rds')%>% readRDS()
+
+ps_filtered <- ps.all %>%  # Remove samples that do not have any  reads 
+  # remove adult samples and samples that had <5000 reads (only 3 in dataset but unreliable 16S data)
+  subset_samples(reads>=5000
+  )%>% 
+  # remove rare taxa present in at least 2 samples
+  filter_taxa(function(x) sum(x > 0) > 1, prune = TRUE) %>% 
+  prune_samples(sample_sums(.) > 0, .) 
+
+trainingSamples=ps.all %>%  # Remove samples that do not have any  reads 
+  # remove adult samples and samples that had <5000 reads (only 3 in dataset but unreliable 16S data)
+  subset_samples(reads>=5000 & 
+                   age_months <= 36 # stop at 36 months since after that it's only Kenyan samples
+                 & diarrhea%in%c('No',NA) # remove kids known to have diarrhea
+                 & (is.na(WHZ) | WHZ>=-2)
+  )
+
+samplesToRemove=setdiff(sample_names(ps_filtered),sample_names(trainingSamples))
+
+# calculate relative abundances
+ps_filtered.ra <- transform_sample_counts(ps_filtered, function(x){x/sum(x)})
+ps_filtered.clr=ps_filtered %>% microbiome::transform(., 'clr') 
+
+
+#### Run Analysis
+
+## Continuous Models
+# general runs
+outcomeVariables <- c("age_months")
+nonOTUPredictors <- c()
+
+# infant samples only
+ps.infant <- ps_filtered.ra 
+output.dir=file.path("./machine-learning", 
+                    "RF-16S",
+                     "infant_only-ra")
+dir.create(output.dir)
+rfResults <- rf_trnL_pipeline(ps.infant, 
+                              outcomeVariables, 
+                              samplesToRemove=samplesToRemove,
+                              nonOTUPredictors = nonOTUPredictors, 
+                              trainIndices = NULL, 
+                              iterations = 10, # script run 10x for 100 total iterations
+                              trainProportion = 0.8, 
+                              modelType = "rf",
+                              correlationType = "spearman", 
+                              title = "", runPCA = FALSE, center = TRUE, scale = TRUE, featureSelection = FALSE, 
+                              plotImportances = FALSE, 
+                              plotResult = FALSE, 
+                              plotPDP = FALSE, 
+                              saveImportances = TRUE, 
+                              outDir = output.dir, 
+                              savePredictions = TRUE,
+                              saveImportancePlots = FALSE)
+saveRDS(rfResults, file = file.path(output.dir, paste0(gsub(':| ','',sub(' ','_',Sys.time())),'-16SRfOutput.rds'))) # uniquely name each file based on system time to allow for simultaneous running of multiple iterations
+
+
+
+```
+
+
+
+# parse data
+
+```{r}
+parent=getwd()
+
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+data.dir=file.path(getwd(),
+                   'RF-16S')
+```
+
+
+## S4.a) model fit
+```{r}
+dirs=c('infant_only-ra')
+rf.df.all <- data.frame(
+  model=character(0),
+  value = numeric(0),
+  iteration = character(0)
+)
+for (dir in dirs) { 
+files<-list.files(file.path(data.dir,
+dir))
+
+# combine fit outputs
+rfResults.files<-files[grepl('RfOutput',files)] 
+rfResults.files
+for (i in (seq_along(rfResults.files))) {
+  file=rfResults.files[i]
+  rfResults=readRDS(file.path(data.dir,
+                       dir,
+                       file))
+  true=data.frame(rfResults$true$correlations)
+true$type='true'
+shuff=data.frame(rfResults$shuff$correlations)
+shuff$type='shuffled'
+
+rf.df<-bind_rows(true,shuff) %>%
+  mutate(iteration=substr(row.names(.),2,2)) %>%
+  dplyr::rename(value=age_months) %>%
+  mutate(model=dir)
+rf.df.all=bind_rows(rf.df,rf.df.all)
+}
+rf.df.all
+# plot fit
+}
+
+
+
+ rf.df.all %>%
+   mutate(type=ifelse(type=='true','True','Shuffled'))%>%
+  ggplot(aes(x=type,y=value)) + geom_boxplot()  +
+   labs(y='Spearman Correlation')+theme_bw()+theme(
+    axis.text.y = element_text(size = 22, face = "bold",color='black'),
+     axis.text.x = element_text(size = 22, face = "plain",color='black'),
+    axis.title.y = element_text(size = 24, face = "bold"),
+    axis.title.x = element_blank()
+  )
+
+  ggsave('results-ra-age.png')
+```
+
+### results
+```{r}
+# combine importance outputs
+importanceDf <- data.frame(
+  iteration = character(0),
+  OTU = character(0),
+  importance = numeric(0),
+  type = character(0),
+  model=character(0)
+)
+
+for (dir in dirs) { 
+files<-list.files(file.path(data.dir,
+dir))
+importanceDf.files<-files[grepl('importanceDf',files)] 
+
+
+for (i in seq_along(importanceDf.files)) { 
+  file=importanceDf.files[i]
+  file
+  df=read.csv(file.path(data.dir,
+                        dir,
+                        file)) 
+  colnames(df)[1]='iteration'
+  df=df %>%
+    pivot_longer(cols=-c('iteration'),names_to='OTU',values_to = 'importance') %>%
+    mutate(model=dir)
+ df$type=unlist(str_split(file,'_'))[2]
+ importanceDf
+ importanceDf=bind_rows(importanceDf,df)
+}
+importanceDf
+}
+importanceDf
+```
+
+
+##### save importances
+```{r}
+write.csv(df, (file.path(data.dir,
+                         'AvgImportances.csv')))
+write.csv(importanceDf, (file.path(data.dir,
+                         'ImportanceDf.csv')))
+```
+## S4.b) top predictors
+```{r}
+importanceDf=file.path(data.dir,
+                         'AvgImportances.csv') %>%
+                read.csv()
+df=file.path(data.dir,
+                         'ImportanceDf.csv') %>%
+  read.csv()
+              df
+```
+```{r}
+avgImportances<-importanceDf %>% 
+  group_by(OTU,model) %>%
+  summarise(avgImportance=mean(importance)) %>%
+  arrange(-avgImportance) %>%
+  group_by(model) %>%
+  dplyr::slice(1:20)  # top 20 OTUs
+avgImportances 
+```
+## plot 
+
+
+```{r}
+importanceDf %>%
+    ggplot(aes(x=importance,y=reorder(name, importance, FUN=median))) + geom_boxplot() +
+    theme_bw() +
+    labs(x="Importance", y=NULL) +
+    theme(axis.text.y=element_text(size=12)) + ggtitle('Top 20 predictors of age') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'none')
+  ggsave(file.path(data.dir,
+                   'top-20-age-predictors_bymodel.png'),
+         width=5,
+         height=7)
+```
+
+
+## read age predictions
+```{r}
+
+dir='infant_only-ra'
+files<-list.files(file.path(data.dir,dir))
+predictions.files<-files[grepl('predictionsDf',files)] 
+predictions.files[1]
+f1=file.path(data.dir,dir,predictions.files[1]) %>%
+  readRDS()
+f1
+```
+
+```{r}
+# combine importance outputs
+predictionsDf <- data.frame(
+  sample = character(0),
+  prediction = numeric(0),
+  iteration = numeric(0)
+)
+
+for (i in seq_along(predictions.files)) {
+  file=predictions.files[i]
+  file
+  df=readRDS(file.path(data.dir,
+                        dir,
+                        file)) 
+  df
+ predictionsDf=bind_rows(predictionsDf,df)
+}
+predictionsDf
+
+avgPredictions.age<-predictionsDf %>% 
+  group_by(sample) %>%
+  summarise(MicrobiomeAge=mean(prediction),
+            sd=sd(prediction)) %>%
+  arrange(-MicrobiomeAge) %>%
+  dplyr::rename(MicrobiomeAge=MicrobiomeAge)
+avgPredictions.age
+```
+
+## compare to true age
+
+
+```{r}
+ps<-ps.16S
+ps
+
+sample_data(ps)=ps@sam_data %>%
+  data.frame() %>%
+  rownames_to_column(var='sample') %>%
+  merge(avgPredictions.age,by='sample') %>%
+  column_to_rownames(var='sample')
+
+ps@sam_data %>%
+  data.frame() %>%
+  select(MicrobiomeAge) %>%
+  write.csv('microbiomeAge_infant-onlyra.csv')
+
+```
+```{r}
+avgPredictions.age=read.csv('microbiomeAge_infant-onlyra.csv') %>%
+  dplyr::rename(sample=X)
+avgPredictions.age
+```
+
+
+```{r}
+
+data=ps.16S@sam_data %>%
+  data.frame() %>%
+  rownames_to_column(var='sample')%>%
+  left_join(avgPredictions.age,by='sample')%>%
+  subset(!is.na(MicrobiomeAge))
+data
+```
+
+### calculate MAZ
+
+```{r}
+data=data%>% # difference between age and predicted age 
+  mutate(age_diff=as.numeric(MicrobiomeAge)-as.numeric(age_months),
+         age_months=as.numeric(age_months)) %>%
+  subset(!is.na(MicrobiomeAge) & !is.na(country)) %>%
+  mutate(Microbiome.Age.Minus.Actual.Age=MicrobiomeAge-age_months)%>%
+  mutate(ageBin=factor(case_when(age_months<=3 ~ "0-3 months",
+                           between(age_months,4,7) ~ "4-7 months",
+                           between(age_months,8,10)~"8-10 months",
+                           between(age_months,11,13)~"11-13 months",
+                           between(age_months,14,16)~"14-16 months",
+                           between(age_months,17,19)~"17-19 months",
+                           between(age_months,20,22)~"20-22 months",
+                           between(age_months,23,47)~"2-3 years")))
+
+maz=data%>%
+  group_by(ageBin)%>%
+  summarise(median=median(MicrobiomeAge),
+            sd=sd(MicrobiomeAge))
+maz
+
+data$MAZ=(data$MicrobiomeAge-maz$median[maz$ageBin==data$ageBin])/(maz$sd[maz$ageBin==data$ageBin])
+
+
+for (i in 1:nrow(data)) {
+  MbAge=data$MicrobiomeAge[i]
+  agebin=data$ageBin[i]
+  med=maz$median[maz$ageBin==agebin]
+  std=maz$sd[maz$ageBin==agebin]
+  MAZ=(MbAge-med)/std
+  data$MAZ[i]=MAZ
+}
+
+
+```
+## S4.d) Predicted vs. actual age
+```{r}
+library(MetBrewer)
+
+sp<-cor.test(as.numeric(data$age_months), as.numeric(data$MicrobiomeAge), method="spearman")
+sp
+data%>%
+  mutate(across(c(age_months,MicrobiomeAge),as.numeric))%>%
+  ggplot(aes(x=age_months,y=MicrobiomeAge)) +
+  geom_jitter(alpha=0.5) + 
+  geom_abline(slope=1,intercept=0,color='red',linetype='dashed') +
+  xlim(0,max(data$age_months)) +
+  ylim(0,max(avgPredictions.age$MicrobiomeAge)) +
+   theme_bw() +
+  geom_smooth(se=FALSE)+ 
+  labs(caption = paste("Spearman's rank correlation: \np-value =",format(sp$p.value,scientific=TRUE,digits=3),"\nrho =",round(sp$estimate,digits =2)),
+       y='Microbiome Age (months)',
+       x='Actual Age (months)')
+
+ggsave('predicted-vs-actual-16s-age.png')
+```
+
+# How do predictors match literature, clustering analysis
+## open data
+```{r}
+setwd('RF-16S')
+importanceDf=read.csv('AvgImportances.csv')
+df=read.csv('ImportanceDf.csv') 
+importanceDf
+```
+
+```{r}
+gordonseqs=read.csv('gordon-seqs.csv') %>%# from Subramanian et al 2014 supplemental data
+  mutate(name_gordon=sub(".*;", "", GordonName))
+gordonseqs
+```
+### retrieve taxa cluster assignments
+
+```{r}
+getClusters=function(ps_filtered,
+                           NumClusters=10, # default 10
+                           ra_cutoff=0.005, # default relative abundance cutoff is 0.5%
+                           filePrefix='' # for distinguishing different iterations
+) {
+  ps_filtered.ra <- transform_sample_counts(ps_filtered, function(x){x/sum(x)})
+  otu.df=ps_filtered.ra@otu_table%>%
+  data.frame()%>%
+  rownames_to_column()%>%
+  pivot_longer(-rowname,names_to='name',values_to='ra')%>%
+  merge(data.frame(ps_filtered.ra@sam_data)%>%select(age_months,country),by.x='rowname',by.y=0,all.x=TRUE)
+otu.df
+
+otu.df.by.age=otu.df%>%
+  mutate(age_bin=case_when(age_months<=2 ~ 1,
+                           between(age_months,2,4) ~ 3,
+                           between(age_months,5,7) ~ 6,
+                           between(age_months,8,10)~9,
+                           between(age_months,11,13)~12,
+                           between(age_months,14,16)~15,
+                           between(age_months,17,19)~18,
+                           between(age_months,20,22)~21,
+                           between(age_months,23,25)~24,
+                           age_months>25 ~ 36
+                           ))%>%
+  group_by(age_bin,name)%>%
+  summarise(avg_ra=mean(ra))
+otu.df.by.age
+
+plotme=otu.df.by.age%>%
+  pivot_wider(names_from='age_bin',values_from = 'avg_ra')%>%
+  column_to_rownames(var='name')
+plotme$country=NULL
+plotme=plotme[ , order(as.numeric(names((plotme))))]
+
+
+# Step 1: Calculate the variance for each row
+row_variances <- apply(plotme, 1, var)
+
+# Step 2: Order the dataframe by decreasing row variances
+plotme <- plotme[order(-row_variances), ]
+plotme
+
+rowmax=apply(plotme, 1, max)
+nonZeroIndices <- which(rowmax >= ra_cutoff) # there is at least 1 age bin with x prevalence of taxon
+data_matrix=plotme[nonZeroIndices, ]
+row_z_scores <- t(apply(data_matrix, 1, function(x) (x - mean(x)) / sd(x)))
+
+# Convert back to a data frame or matrix with the original column names
+row_z_scores_df <- as.data.frame(row_z_scores)
+colnames(row_z_scores_df) <- colnames(data_matrix)
+row_z_scores_df
+
+dist_matrix <- dist(row_z_scores_df) # t() transposes the matrix for row-wise clustering
+hc <- hclust(dist_matrix, method = "average")
+plot(hc)
+# Step 2: Cut the dendrogram to form clusters
+# Specify the number of clusters you want, for example, 10
+
+clusters <- data.frame(cutree(hc, k = NumClusters))
+colnames(clusters)=c('Cluster')
+
+df_cluster=clusters%>%
+  rownames_to_column(var='Feature')%>%
+  mutate(Feature=gsub("^X","",Feature))%>%
+  mutate(Feature=gsub("^_","",Feature))
+
+df_cluster
+
+plot=pheatmap(plotme[nonZeroIndices, ], 
+         cutree_rows = NumClusters, 
+         show_colnames = TRUE, 
+         cluster_cols  = FALSE,
+         annotation_names_row = FALSE,
+         #annotation_colors=mycolors,
+         annotation_row=df_cluster%>%column_to_rownames(var='Feature')%>%mutate(Cluster=factor(Cluster)),
+         clustering_method='average',
+         scale='row',
+         color = colorRampPalette(c("#0B3954",
+                                    "#A0C1B9",
+                                    "#F4E8C1"))(100),
+         angle_col = 0)
+print(plot)
+ggsave(plot=plot,filename=paste0(filePrefix,'_',NumClusters,'-clusters.png'),
+       height=12,
+       width=10)
+  return(df_cluster)
+}
+```
+
+```{r}
+ps.16S@sam_data$reads=sample_sums(ps.16S)
+ps.all<- ps.16S %>%
+  subset_samples(reads>5000)%>%
+   filter_taxa(function(x) sum(x > 0) > 1, prune = TRUE) 
+
+taxdf<-ps.all@tax_table %>%
+  data.frame() %>%
+  mutate(name=ifelse(!is.na(Species),paste(Genus,Species,sep='_'), # setting "name" to the lowest taxonomic level that was assigned 
+                     ifelse(!is.na(Genus),Genus, # there is probably a much more elegant way to do this but oh well
+                            ifelse(!is.na(Family),Family,
+                                   ifelse(!is.na(Order),Order,Phylum)))))
+taxdf$name<-make.unique(taxdf$name,sep='_')
+taxdf$name=gsub("[^[:alnum:]]", "_", taxdf$name) # remove special characters
+taxdf$name=gsub(" ", "_", taxdf$name) # remove whitespace
+taxdf$name=gsub("^X","",taxdf$name)
+taxdf$name=gsub("^_","",taxdf$name)
+
+
+tax_table(ps.all)<-as.matrix(taxdf)
+taxa_names(ps.all)=ps.all@tax_table[,8]
+
+
+ps_filtered <- ps.all %>%  # Remove samples that do not have any  reads 
+  # remove  samples that had <5000 reads (only 3 in dataset but unreliable 16S data)
+  subset_samples(reads>=5000 
+                 & age_months <= 36 # only Kenyan kids after 36mo, removing them to avoid skewing results
+                 &diarrhea%in%c('No',NA) # remove kids known to have diarrhea
+                 &(is.na(WHZ) | WHZ>=-2) # remove acutely malnourished kids (known to have immature microbiome)
+                 )%>% 
+  prune_samples(sample_sums(.) > 0, .) %>%
+  filter_taxa(function(x) sum(x > 0) > 1, prune = TRUE)
+
+ps_filtered <- ps_filtered %>% 
+  subset_samples(!is.na(age_months) & !is.na(subj)) #need to remove all samples that have missing data
+
+# calculate relative abundances
+ps_filtered.ra <- transform_sample_counts(ps_filtered, function(x){x/sum(x)})
+
+```
+## compare gordon RF, my RF, to clustering 
+```{r}
+
+df_clusters=getClusters(ps_filtered,
+                       filePrefix = '',
+                       ra_cutoff=0.005)
+df_clusters
+```
+
+```{r}
+clusters=df_clusters%>%column_to_rownames(var='Feature')
+```
+
+```{r}
+cluster.seqs=taxdf%>%
+  data.frame()%>%
+  rownames_to_column(var='OTU')%>%
+  subset(name%in%row.names(clusters))%>%
+  left_join(clusters%>%rownames_to_column(var='name'),by='name')%>%
+  select(OTU,Cluster)%>%
+  dplyr::rename(cluster=Cluster)
+cluster.seqs
+```
+
+```{r}
+importanceRanking=df%>%
+  group_by(OTU,model) %>%
+  summarise(avgImportance=mean(importance)) %>%
+  left_join(data.frame(taxdf)%>%select(name)%>%rownames_to_column(var='OTU'),by='OTU')%>%
+  left_join(gordonseqs%>%dplyr::rename(OTU=GordonLab,GordonRanking=RankOrder),by='OTU')%>%
+  left_join(cluster.seqs,by='OTU')%>%
+  arrange(-avgImportance) 
+importanceRanking$RF.Ranking=seq(1:nrow(importanceRanking))
+
+```
+## S4.c) venn diagram 
+```{r}
+
+GordonLab = gordonseqs$GordonLab
+MyRF = importanceRanking$OTU[importanceRanking$RF.Ranking<=100] # my top 100 predictors
+InClustering = importanceRanking$OTU[importanceRanking$cluster%in%c(1,2,4)]
+
+all_elements <- unique(c(GordonLab, MyRF, InClustering))
+
+# Create a logical matrix
+vennData <- data.frame(
+  GordonLab = all_elements %in% GordonLab,
+  MyRF = all_elements %in% MyRF,
+  InClustering = all_elements %in% InClustering
+)
+
+library(limma)
+vennMatrix <- as.matrix(vennData)
+colnames(vennMatrix) <- c("Subramanian et al, 2014", "Top 100 Predictors", "InClustering")
+png("venndiagram-16s-age-predictors.png")
+vennDiagram(vennMatrix,cex=c(1,1,1))
+dev.off()
+vennDiagram(vennMatrix,cex=c(1,1,1))
+```
+```{r}
+
+t=data.frame(taxdf)
+t
+shuffledTaxa=sample(row.names(t),100) # pick a random set of 100 taxa
+shuffledTaxa
+
+all_elements <- unique(c(GordonLab, shuffledTaxa, InClustering))
+
+# Create a logical matrix
+vennData <- data.frame(
+  GordonLab = all_elements %in% GordonLab,
+  shuffledTaxa = all_elements %in% shuffledTaxa,
+  InClustering = all_elements %in% InClustering
+)
+
+library(limma)
+vennMatrix <- as.matrix(vennData)
+colnames(vennMatrix) <- c("Subramanian et al, 2014", "100 Random Taxa", "InClustering")
+#png("venndiagram-16s-age-predictors_shuff.png")
+vennDiagram(vennMatrix,cex=c(1,1,1))
+#dev.off()
+```
+
+```{r}
+set1=GordonLab
+set2=MyRF
+all_elements <- unique(c(GordonLab,row.names(t)))
+
+print('Subramanian et al vs Random Forest')
+# Create a contingency table
+in_set1_only <- sum(all_elements %in% set1 & !(all_elements %in% set2))
+in_set2_only <- sum(all_elements %in% set2 & !(all_elements %in% set1))
+in_both_sets <- sum(all_elements %in% set1 & all_elements %in% set2)
+in_neither_set <- length(all_elements) - (in_set1_only + in_set2_only + in_both_sets)
+
+contingency_table <- matrix(c(in_both_sets, in_set1_only, in_set2_only, in_neither_set), nrow = 2)
+colnames(contingency_table) <- c("In Set 1", "Not In Set 1")
+rownames(contingency_table) <- c("In Set 2", "Not In Set 2")
+
+# Perform Fisher's Exact Test
+fisher_test_result <- fisher.test(contingency_table)
+print(fisher_test_result)
+
+print('Early/Transitional/Late Microbiome Cluster taxa vs. in Random Forest')
+set1=InClustering
+set2=MyRF
+all_elements <-row.names(t)
+
+# Create a contingency table
+in_set1_only <- sum(all_elements %in% set1 & !(all_elements %in% set2))
+in_set2_only <- sum(all_elements %in% set2 & !(all_elements %in% set1))
+in_both_sets <- sum(all_elements %in% set1 & all_elements %in% set2)
+in_neither_set <- length(all_elements) - (in_set1_only + in_set2_only + in_both_sets)
+
+contingency_table <- matrix(c(in_both_sets, in_set1_only, in_set2_only, in_neither_set), nrow = 2)
+colnames(contingency_table) <- c("In Set 1", "Not In Set 1")
+rownames(contingency_table) <- c("In Set 2", "Not In Set 2")
+
+# Perform Fisher's Exact Test
+fisher_test_result <- fisher.test(contingency_table)
+print(fisher_test_result)
+```
+
+
+
+
+

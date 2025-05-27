@@ -1,0 +1,170 @@
+---
+title: "Fig. S1"
+output: html_notebook
+---
+
+# ***setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(phyloseq)
+library(conflicted)
+library(scales)
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+
+hiroshige=c(met.brewer('Hiroshige')[c(1,4,6)],'#7DA4CA','#31475E')
+
+```
+
+## open data
+
+```{r}
+# file paths
+parent=getwd()
+
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+
+
+```
+
+```{r}
+p=ps.trnL%>%
+  subset_taxa(!is.na(superkingdom))%>%
+  filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE)
+
+data=data.frame(p@otu_table)
+
+data$country=p@sam_data$country
+
+# Assign each food as 1 or 0 depending on whether it was detected in that country
+data=data%>%
+  rownames_to_column()%>%
+  pivot_longer(-c(rowname,country))%>%
+  mutate(value=ifelse(value>0,1,0))%>%
+  group_by(country,name)%>%
+  summarise(n=sum(value), # number of samples in that country with that food
+            percent=sum(value)/n()) %>%
+  mutate(any=ifelse(n>0,1,0),
+         onepercent=ifelse(percent>0.01,1,0))%>%
+  group_by(name)%>%
+  summarise(nCountries_anyDetected=sum(any),
+            nCountries_1percentcutoff=sum(onepercent))
+
+summary_anyDetected <- data %>%
+  dplyr::count(nCountries_anyDetected) %>%
+  complete(nCountries_anyDetected = 0:5, fill = list(n = 0))  # Ensure all values 0-5 are included
+
+# Count for nCountries_1percentcutoff
+summary_1percentcutoff <- data %>%
+  dplyr::count(nCountries_1percentcutoff) %>%
+  complete(nCountries_1percentcutoff = 0:5, fill = list(n = 0))  # Ensure all values 0-5 are included
+# Rename and merge
+summary_data <- summary_anyDetected %>%
+  dplyr::rename(Count_anyDetected = n) %>%
+  inner_join(summary_1percentcutoff %>% dplyr::rename(Count_1percentcutoff = n, Value = nCountries_1percentcutoff),
+             by = c("nCountries_anyDetected" = "Value")) %>%
+  select(
+    Value = nCountries_anyDetected,
+    Count_anyDetected,
+    Count_1percentcutoff
+  )
+
+# View the result
+print(summary_data)
+```
+
+## b) boxplot of food specificity
+
+```{r}
+color_ramp <- colorRampPalette(c('#BCD8F1','#143B5D'))
+colors <- color_ramp(6)
+
+plot=summary_data%>%
+  pivot_longer(-Value)%>%
+  mutate(Value=factor(Value))%>%
+  group_by(name)%>%
+  summarise(percent =100*value/sum(value),
+            Value=Value,
+            value=value) %>% 
+  mutate(name=ifelse(name=='Count_anyDetected','Threshold:\n>0% prevalence','Threshold:\n>1% prevalence'),
+         percent=paste0(round(percent),'%'))%>%
+  mutate(name=factor(name,levels=c('Threshold:\n>0% prevalence','Threshold:\n>1% prevalence')))%>%
+  subset(!(name=='Threshold:\n>0% prevalence' & value==0))%>%
+  ggplot(aes(fill=Value,y=value,x=name))+geom_col(position='fill')+facet_wrap(~name,scales='free')+scale_fill_manual(values=colors)+theme_bw()+labs(fill='Number of countries\nwhere detected',x='',y='Percent of Samples',title='Plant foods')+ scale_y_continuous(labels = scales::percent)+ 
+  geom_text(aes(label = percent),
+              position = position_fill(vjust = 0.5), 
+              color = "white")+
+  theme(legend.position = 'bottom',
+        axis.text.x=element_blank(),
+        text = element_text(family='Arial',size=18,face='bold'),
+        strip.background = element_rect(fill = "white", color = "black"),
+    panel.grid = element_blank(),
+    # axis.text.y = element_text(size = 22, face = "bold",color='black'),
+    # axis.title.y = element_text(size = 24, face = "bold"),
+    # axis.title.x = element_text(size = 24, face = "bold"),
+        legend.direction = 'horizontal')+
+guides(fill = guide_legend(nrow = 1)) 
+plot
+ggsave('barplot-nShared-foods_stacked.png',
+       height=5,
+       width=7)
+
+```
+
+## d) aFR by country
+```{r}
+data=ps.trnL@sam_data%>%
+  data.frame()
+ps=ps.12sv5%>%
+   subset_taxa(., species!='Homo sapiens') 
+ps@sam_data$aFR=ifelse(ps@otu_table>0,1,0) %>%  # count food if >0 reads
+  rowSums()
+
+aFR=ps@sam_data%>%
+  data.frame()%>%
+  select(aFR)
+aFR
+
+data=data%>%
+  merge(aFR,by=0,all.x=TRUE)
+
+ann.df=data%>%
+  group_by(country)%>%
+  summarise(Q25=quantile(aFR,0.25,na.rm=TRUE),
+            median=median(aFR,na.rm=TRUE),
+            Q75=quantile(aFR,0.75,na.rm=TRUE))%>%
+  mutate(caption=paste0(median,' (',Q25,',',Q75,')'))
+ann.df
+plot=data%>%
+  left_join(ann.df,by='country')%>%
+  mutate(country_ann = paste(country, "\n", caption)) %>%
+  ggplot(aes(y=reorder(country_ann,Q75),x=aFR,color=country_ann))+geom_boxplot(outlier.alpha = 0)+
+  theme_bw()+
+  geom_jitter(alpha=0.5,width=0.3)+
+  scale_fill_manual(values=hiroshige)+
+  scale_color_manual(values=hiroshige)+
+  ylab('Country\nMedian (IQR)\n') +
+  xlab('Animal dietary diversity') +
+  labs(color = 'Country') +
+  scale_color_manual(values = hiroshige) + 
+  theme(
+    legend.position = 'none',  # Keep legend
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 22, face = "bold",color='black'),
+     axis.text.x = element_text(size = 22, face = "plain",color='black'),
+    axis.title.y = element_text(size = 24, face = "bold"),
+    axis.title.x = element_text(size = 24, face = "bold")
+  )
+plot
+ggsave('aFR-by-country.png')
+```

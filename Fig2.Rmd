@@ -1,0 +1,623 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# ***setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+library(conflicted)
+
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+# merge PC data into phyloseq metadata
+pcData=function(ps,pcaPlot,nPCs=10) {
+  pc.data=ps@sam_data %>%
+  data.frame() %>%
+  mutate(name=row.names(.)) %>%
+  merge(pcaPlot$data[,1:(nPCs+1)],by='name')
+}
+
+
+pcaPlot<-function(ps, # clr transformed and filtered data
+                  colorVar, # variable from samdf to color samples by
+                  colorName, # what to display variable name as in legend
+                  nTaxa, # number of taxa to display
+                  arrowLength=1, # multiplier for arrow length
+                  showLoadings=TRUE,
+                  alpha=0.5 # point transparancy 
+                  ) { 
+  if("name" %in% colnames(data.frame(ps@sam_data) )) { # there will be an error if there is a column called "name" in the ps object
+  sample_data(ps)=ps@sam_data%>%
+    data.frame() %>%
+    dplyr::rename(name.x=name)
+  }
+  samdf <- data.frame(ps@sam_data)%>%
+    rownames_to_column(var = 'name')
+  
+  # PCA
+  pca <- prcomp(ps@otu_table, center = TRUE, scale = FALSE)
+  
+  pca.df <- data.frame(pca$x) %>% 
+          rownames_to_column(var = 'name')
+  
+  # % variance explained
+  eigs <- pca$sdev^2
+  varExplained <- 100 * round(eigs/sum(eigs), 5)
+  
+  # pull out first 2 PC variance explained for the plot
+  ve.pc1 <- as.character(round(varExplained[1], 3))
+  ve.pc2 <- as.character(round(varExplained[2], 3))
+  
+  # Add back sample data
+  pca.df <- left_join(pca.df, samdf)
+  
+  # Calculate plotting limits based on largest value observed in PC axes 1 and 2
+  limit <- max(abs(pca.df[, c('PC1', 'PC2')])) +
+            0.05*(max(abs(pca.df[, c('PC1', 'PC2')])))
+  
+  
+
+  pca.plot <- 
+       ggplot(pca.df, aes_string(x = "PC1", y = "PC2", color = colorVar)) +
+       geom_point(size = 2, alpha = alpha) +
+       coord_equal() +
+       labs(x = paste0(' PC1 (', ve.pc1, '%)'),
+            y = paste0(' PC2 (', ve.pc2, '%)')) + 
+       xlim(-limit, limit) + ylim(-limit, limit)+
+       theme_classic() +
+       theme(axis.line = element_line(size = 1, color = 'black'),
+             axis.ticks = element_line(color = 'black'),
+             axis.title = element_text(size = 14, face = 'bold', color = 'black'),
+             # axis.text = element_blank(),
+             # legend.background = element_blank(),
+             # legend.title = element_blank(),
+             #legend.position = "none"
+             # legend.text = element_text(size = 10, face = 'bold'),
+             ) 
+
+if (showLoadings==FALSE) { return(pca.plot)} else { 
+  # Biplot
+  
+  # Calculate loadings
+  V <- pca$rotation # Eigenvectors
+  L <- diag(pca$sdev) # Diag mtx w/sqrts of eigenvalues on diag.
+  loadings <- V %*% L
+       
+  # Get loadings for first 2 PCs and format for plotting
+  pythag <- function(a, b){sqrt(a^2 + b^2)}
+  loadings.12 <- data.frame(loadings[, 1:2]) %>%
+       dplyr::rename(PC1 = X1, PC2 = X2) %>% 
+       mutate(variable = row.names(loadings)) %>% 
+       mutate(length = pythag(PC1, PC2), slope = PC2/PC1, ang = atan(slope)*(180/pi))
+  
+  loadings.plot <- top_n(loadings.12, nTaxa, wt = length) 
+  
+   loadings.plot <- top_n(loadings.12, nTaxa, wt = length) 
+  
+  # Rename loadings with lowest taxonomic level
+  loadings.taxtab <- tax_table(ps)[row.names(loadings.plot)] %>% 
+       data.frame() 
+  loadings.taxtab <- loadings.taxtab[cbind(1:nrow(loadings.taxtab), max.col(!is.na(loadings.taxtab), ties.method = 'last'))] %>%  
+    data.frame()
+  colnames(loadings.taxtab) <- c("name")
+  loadings.taxtab$asv <- tax_table(ps)[row.names(loadings.plot)] %>% 
+    data.frame() %>% 
+    rownames()
+  
+  
+  loadings.plot <- loadings.taxtab %>% 
+       dplyr::select(asv,name) %>% 
+       right_join(loadings.plot, by = c('asv' = 'variable'))
+  
+  # What quadrant of the plot is the label in?
+  q1 <- filter(loadings.plot, PC1 > 0 & PC2 > 0)
+  q2 <- filter(loadings.plot, PC1 < 0 & PC2 > 0)
+  q3 <- filter(loadings.plot, PC1 < 0 & PC2 < 0)
+  q4 <- filter(loadings.plot, PC1 > 0 & PC2 < 0)
+       
+  pca.biplot <- 
+       pca.plot + 
+       geom_segment(data = loadings.plot,
+                    aes(x = 0, y = 0, 
+                        xend = arrowLength*PC1, yend = arrowLength*PC2),
+                    color = 'black',
+                    arrow = arrow(angle = 15, 
+                                  length = unit(0.1, 'inches'))) + 
+    labs(color = colorName)
+  
+  # Then add geom_text quadrant-by-quadrant, aligning text accordingly
+       if (dim(q1)[1] != 0) {
+            pca.biplot <- pca.biplot +
+                 geom_text(data = q1, aes(x = arrowLength*PC1, y = arrowLength*PC2, hjust = 0, angle = ang,
+                                          label=paste0('   ', name),
+                                          fontface = 'bold'),
+                           color = 'black', show.legend = FALSE)
+       }
+       if (dim(q2)[1] != 0) {
+            pca.biplot <- pca.biplot +
+                 geom_text(data = q2, aes(x = arrowLength*PC1, y = arrowLength*PC2, hjust = 0, angle = ang,
+                                          label=paste0(name, '   '),
+                                          fontface = 'bold'),
+                           color = 'black', show.legend = FALSE)
+       }
+       if (dim(q3)[1] != 0) {
+            pca.biplot <- pca.biplot +
+                 geom_text(data = q3, aes(x = arrowLength*PC1, y = arrowLength*PC2, hjust = 0, angle = ang,
+                                          label=paste0(name, '   '),
+                                          fontface = 'bold'),
+                           color = 'black', show.legend = FALSE)
+       }
+       if (dim(q4)[1] != 0) {
+            pca.biplot <- pca.biplot +
+                 geom_text(data = q4, aes(x = arrowLength*PC1, y = arrowLength*PC2, hjust = 0, angle = ang,
+                                          label=paste0('   ', name),
+                                          fontface = 'bold'),
+                           color = 'black', show.legend = FALSE)
+       }
+  
+  return(pca.biplot)
+}}
+
+
+
+pcaLoadingsPlot<-function(ps, # clr transformed and filtered data
+                  nTaxa, 
+                  PCs=c(1,2), #which PC loadings to plot. default is PC1 and PC2
+                  title=''
+                  ) { 
+  if("name" %in% colnames(data.frame(ps@sam_data) )) { # there will be an error if there is a column called "name" in the ps object
+  sample_data(ps)=ps@sam_data%>%
+    data.frame() %>%
+    dplyr::rename(name.x=name)
+  }
+  samdf <- data.frame(ps@sam_data)%>%
+    rownames_to_column(var = 'name')
+  
+  # PCA
+  pca <- prcomp(ps@otu_table, center = TRUE, scale = FALSE)
+
+  # Calculate loadings
+  V <- pca$rotation # Eigenvectors
+  L <- diag(pca$sdev) # Diag mtx w/sqrts of eigenvalues on diag.
+  loadings <- V %*% L
+       
+  # Get loadings for first 2 PCs and format for plotting
+  loadings.plot <- data.frame(loadings[, PCs])
+  colnames(loadings.plot)=paste0('PC',PCs)
+  loadings.plot$variable = row.names(loadings)
+  
+  # Rename loadings with lowest taxonomic level
+  loadings.taxtab <- tax_table(ps)[row.names(loadings.plot)] %>% 
+       data.frame() 
+  loadings.taxtab <- loadings.taxtab[cbind(1:nrow(loadings.taxtab), max.col(!is.na(loadings.taxtab), ties.method = 'last'))] %>%  
+    data.frame()
+  colnames(loadings.taxtab) <- c("name")
+  loadings.taxtab$asv <- tax_table(ps)[row.names(loadings.plot)] %>% 
+    data.frame() %>% 
+    rownames()
+  
+  
+  loadings.plot <- loadings.taxtab %>% 
+       dplyr::select(asv,name) %>% 
+       right_join(loadings.plot, by = c('asv' = 'variable'))%>%
+  pivot_longer(contains("PC"),names_to = 'PC',values_to = 'loading') %>%
+  group_by(PC) %>%
+  slice_max(abs(loading), n = nTaxa) %>%
+  mutate(name=ifelse(is.na(name),
+                           asv,
+                           name))
+  library(tidytext)
+plot=loadings.plot %>%
+  mutate(name = reorder_within(name, abs(loading), PC))%>%
+  ggplot(aes(x=loading,y=name))  +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = title, x = "Loading Value", y = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'none') + facet_wrap(~PC,scales='free',ncol=1) + 
+  scale_y_reordered() 
+return(plot)
+}
+
+hiroshige=c(met.brewer('Hiroshige')[c(1,4,6)],'#7DA4CA','#31475E')
+```
+
+## open data
+
+```{r}
+# file paths
+parent=getwd()
+
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+ps.trnL@tax_table[,11]=str_to_title(ps.trnL@tax_table[,11])
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+ps.16S
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+
+
+```
+
+## calculate pFR
+```{r}
+ps.trnL@sam_data$pFR <- ifelse(subset_taxa(ps.trnL,
+                                                 !is.na(superkingdom) # only count ASVs assigned to human foods database
+                                                 )@otu_table>0,1,0) %>%  # count food if >0 reads
+  rowSums()
+```
+
+
+# *** Figure 2 ***
+```{r}
+ps.infant.clr=ps.trnL%>%
+  prune_samples(sample_sums(.) > 0, .) %>% # remove samples with no reads 
+  microbiome::transform('clr')
+ps=subset_taxa(ps.infant.clr,!is.na(superkingdom))
+ps
+```
+##  trnL PCA
+### 2a) country
+```{r}
+update_geom_defaults("text", list(size = 6))
+
+plot=ps%>%
+  pcaPlot('country','Country',5,arrowLength=2,alpha=0.7)+labs(color='Country')+
+  scale_color_manual(values=hiroshige)+
+  xlim(-15,30)+ 
+
+  theme(
+        text = element_text(family = "Arial",
+                            size=25,
+                            face=
+                              'bold'),
+        axis.title = element_text(family = "Arial",
+                            size=25,
+                            face=
+                              'bold'),
+        legend.position = 'none')
+plot
+ggsave('PCA_trnL-byCountry.png',
+       width=7,
+       height = 7)
+
+```
+
+
+
+```{r}
+plot+guides(
+  color = guide_legend(
+    override.aes = list(size = 10)  # size of points in the legend
+  )
+) +
+theme(
+  legend.key.size = unit(.5, "cm"),
+  text = element_text(family = "Arial",
+                            size=30,
+                            face=
+                              'bold'),
+        legend.position = 'right')
+ggsave('country-annotation-vertical.png',
+       width=12,
+       height = 7)
+plot+guides(
+  color = guide_legend(
+    override.aes = list(size = 10)  # size of points in the legend
+  )
+) +
+theme(
+  legend.key.size = unit(.5, "cm"),
+  text = element_text(family = "Arial",
+                            size=30,
+                            face=
+                              'bold'),
+        legend.position = 'bottom')
+ggsave('country-annotation-horizontal.png',
+       width=12,
+       height = 7)
+```
+### 2b) by age
+```{r}
+# Set default text size
+update_geom_defaults("text", list(size = 6))
+
+# Calculate age_percentile
+ps@sam_data$age_percentile = ps@sam_data$age_months / 24
+ps@sam_data$age_percentile[ps@sam_data$age_months > 24] = 30 / 24  # Cap ages >24 months
+
+# Prepare data frame
+data = data.frame(ps@sam_data)
+
+# Set breakpoints for colors
+specific_values = c(0, 6, 12, 18, 24)
+interpolated_percentiles = approx(
+  x = data$age_months, 
+  y = data$age_percentile, 
+  xout = specific_values, 
+  method = "linear"
+)
+
+# Create interpolated results data frame
+interpolated_results = data.frame(
+  age = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+# Define breaks and labels
+breaks = interpolated_results$Interpolated_Percentile
+labels = interpolated_results$age
+colours = met.brewer('Hokusai3', length(breaks))
+r = range(ps@sam_data$age_percentile, na.rm = TRUE)
+
+# Plot
+plot = ps %>% 
+  pcaPlot(., 'age_percentile', 'Age (months)', 5, 2) +
+  scale_color_gradientn(
+    limits  = r,
+    colours = colours[c(1, seq_along(colours), length(colours))],
+    breaks  = breaks,
+    labels  = labels,
+    values  = c(0, scales::rescale(breaks, from = r), 1)
+  ) +
+  labs(color = 'Age (months)') +
+  ggtitle('') +
+  xlim(-15, 30) +
+  theme(
+    text = element_text(family = "Arial", size = 25, face = 'bold'),
+    axis.title = element_text(family = "Arial", size = 25, face = 'bold'),
+    legend.position = 'none'
+  )
+plot
+
+ggsave('2_PCA_trnL-byAgeMonths.png',
+       height=7,
+       width=7)
+```
+
+
+```{r}
+plot+theme(
+        text = element_text(family = "Arial",
+                            size=15,
+                            face=
+                              'bold'),
+        panel.background = element_rect(fill = NA, color = NA),
+  plot.background = element_rect(fill = NA, color = NA),
+  legend.background = element_rect(fill = NA, color = NA),
+    legend.box.background = element_rect(fill = NA, color = NA),
+  legend.title.align = 1,
+        legend.position = 'right')
+ggsave('age-annotation.png')
+
+plot+theme(text = element_text(family = "Arial",
+                            size=15),
+           legend.position = 'bottom')
+ggsave('age-annotation-horizontal.png')
+```
+## 2c) trnL loadings plot
+```{r}
+p=pcaLoadingsPlot(ps,nTaxa=5,PCs=c(1,2))+ theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",
+                            size=27,
+                            color = 'black',
+                            face='bold'
+                            ),
+        axis.text=element_text(family = "Arial",face=
+                              'plain'))
+p
+ggsave('PCA-trnL-loadings.png',
+       height=6,
+       width=7)
+```
+
+## 2d) age and PC1
+```{r}
+ps=subset_taxa(ps.infant.clr,!is.na(superkingdom))
+p=pcaPlot(ps,'age_months','Age (months)',10)
+p
+pcadata=pcData(ps,p)
+
+data=pcadata
+data$age_percentile=data$age_months/24
+data$age_percentile[data$age_months>24]=30/24 # cap age range, set any samples that fall above 24mo to 24mo+6mo (keep scale consistent)
+specific_values <- c(0,6,12,18,24)
+interpolated_percentiles <- approx(x = data$age_months, y = data$age_percentile, xout = specific_values, method = "linear")
+
+# Show results
+interpolated_results <- data.frame(
+  age = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+breaks=interpolated_results$Interpolated_Percentile
+labels=interpolated_results$age
+colours<-met.brewer('Hiroshige',length(breaks))
+r<-range(data$age_percentile)
+
+
+sp<-cor.test(as.numeric(pcadata$PC1), as.numeric(pcadata$age_months), method="spearman")
+sp
+
+data%>%
+  ggplot(aes(x=PC1,y=age_months))+geom_point(alpha=0.5 )+geom_smooth(se=FALSE,method='lm',color='blue') +theme_bw()+labs(y='Age (months)',x='PC1')+ theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",
+                            size=22,
+                            face='bold'),
+        axis.text=element_text(family = "Arial",face=
+                              'plain'))+ 
+  labs(caption = paste(
+      "Spearman's rank correlation:",
+      "\np-value =", format(sp$p.value, scientific = TRUE, digits = 3),
+      "\n\u03C1 =", round(sp$estimate, digits = 2)
+    ))
+ggsave('PC1-trnL-vs-age.png',
+       height=4,
+       width=4)
+```
+
+
+
+## 2e) pFR vs PC1
+```{r}
+ps=subset_taxa(ps.infant.clr,!is.na(superkingdom))
+ps@sam_data$pFR_percentile=rank(ps@sam_data$pFR) / length(ps@sam_data$pFR)
+
+d<-ps@sam_data$pFR
+breaks=quantile(d)[2:4]
+
+r<-range(d[!is.na(d)])
+labels=c(0,paste0(c('25th','50th','75th','Max'),' (',c(breaks,max(r)),')'))
+colours<-met.brewer('Hiroshige',length(labels))
+p=pcaPlot(ps,'pFR_percentile','Plant Richness (pFR)',10)
+p
+pcadata=pcData(ps,p)
+
+sp<-cor.test(as.numeric(pcadata$PC1), as.numeric(pcadata$pFR), method="spearman")
+sp
+
+pcadata%>%
+  ggplot(aes(x=PC1,y=pFR))+geom_point(alpha=0.5)+geom_smooth(se=FALSE,method='lm')+scale_color_gradientn(
+    colours = colours[c(1, seq_along(colours), length(colours))],
+    limits=c(0,1),
+  labels=labels,
+  breaks = c(0,0.25,0.5,0.75,1)) +theme_bw()+labs(y='pFR',x='PC1')+ theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",
+                            size=22,face=
+                              'bold'),
+        axis.text=element_text(family = "Arial",face=
+                              'plain'))+ 
+  labs(caption = paste(
+      "Spearman's rank correlation:",
+      "\np-value =", format(sp$p.value, scientific = TRUE, digits = 3),
+      "\n\u03C1 =", round(sp$estimate, digits = 2)
+    ))+ylim(0,max(ps@sam_data$age_months,na.rm=TRUE))
+ggsave('PC1-trnL-vs-pFR.png',
+       height=4,
+       width=4)
+```
+
+## 2g) pFR vs age
+
+```{r}
+d<-data.frame(ps.trnL@sam_data)%>%
+  subset(!is.na(age_months)&!is.na(pFR))
+x <- d$age_months
+y <- as.numeric(d$pFR)
+
+fit <- nls(y ~ SSlogis(x, Asym, xmid, scal), 
+           data = d, 
+           start = list(Asym = max(as.numeric(y)), xmid = mean(x), scal = 1))
+summary(fit)
+# Generate predictions from the logistic growth curve
+pred_df <- data.frame(x = seq(min(x), max(x), length.out = 100))
+pred_df$y_pred <- predict(fit, newdata = pred_df)
+pred_df$type='Plant Richness'
+```
+
+
+```{r}
+
+# Extract model parameters
+params = coef(fit)
+Asym = params["Asym"]
+xmid = params["xmid"]
+scal = params["scal"]
+
+# Define the first derivative of the logistic function
+dlogis = function(x) {
+  rate = (Asym * exp(-(x - xmid) / scal)) / (scal * (1 + exp(-(x - xmid) / scal))^2)
+  return(rate)
+}
+
+# Plot the first derivative
+x_vals = seq(min(d$age_months), max(d$age_months), length.out = 1000)
+plot(x_vals, dlogis(x_vals), type = 'l', main = 'First Derivative of Logistic Growth')
+
+# Analytical approach to find plateau point
+max_rate = max(dlogis(x_vals))
+threshold_rate = max_rate * 0.5
+end_linear_phase = min(x_vals[dlogis(x_vals) < threshold_rate])
+
+print(paste('The plateau point of pMR with respect to age is at', round(end_linear_phase), 'months'))
+
+```
+
+```{r}
+
+vline.df=data.frame(type=c('Plant Richness'),
+                    age_months=c(round(end_linear_phase)))
+```
+
+```{r}
+d%>%
+  dplyr::mutate(Country=country)%>%
+ggplot(aes(x = age_months, y = pFR)) +
+  geom_jitter(alpha=0.5) +  # Scatter plot of original data
+  geom_line(data = pred_df, aes(x = x, y = y_pred, group=type), color = "blue", size = .8,alpha=0.8) +  # Line plot of logistic growth curve
+  xlab("Age (Months)") +
+  ylab("Plant Richness (pFR)") +
+  theme_classic() +
+  ggtitle("")+ 
+  geom_vline(data = vline.df, aes(xintercept = age_months), linetype = "dashed", color = "red")+
+  theme(text=element_text(size=18,face='bold'),
+        axis.text=element_text(family = "Arial",face=
+                              'plain'),
+        legend.position = 'none')
+ggsave('pMR-vs-age-logistic-curve.png',
+       height=4,
+       width=5)
+```
+
+
+## 2h) pFR by country
+```{r}
+data=ps.trnL@sam_data%>%
+  data.frame()
+ann.df=data%>%
+  group_by(country)%>%
+  summarise(Q25=quantile(pFR,0.25),
+            median=median(pFR),
+            Q75=quantile(pFR,0.75))%>%
+  mutate(caption=paste0(median,' (',Q25,'-',Q75,')'))
+
+
+# Ensure country order matches the sorting of pFR
+data <- data %>%
+  left_join(ann.df, by = "country") %>%
+  mutate(country_ann = paste(country, "\n", caption)#,
+         #country = factor(country, levels = levels(reorder(country, pFR)))
+         )  # Reorder factor levels
+
+# Plot with ordered colors
+plot=ggplot(data, aes(y = reorder(country_ann, pFR), x = pFR, color = country)) +
+  geom_boxplot(outlier.alpha = 0) +  # Boxplot with no outlier points
+  geom_jitter(aes(color = country), alpha = 0.2, width = 0.3, show.legend = FALSE) +  # Jitter points without legend
+  theme_bw() +
+  scale_color_manual(values = hiroshige) + 
+  ylab('Country\nMedian (IQR)\n') +
+  xlab('Plant richness (pFR)') +
+  labs(color = 'Country') +  # Legend title for country colors
+  theme(
+    legend.position = 'none',  # Keep legend
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 22, face = "bold",color='black'),
+     axis.text.x = element_text(size = 22, face = "plain",color='black'),
+    axis.title.y = element_text(size = 24, face = "bold"),
+    axis.title.x = element_text(size = 24, face = "bold")
+  )
+plot
+ggsave('pFR-by-country.png') 
+```

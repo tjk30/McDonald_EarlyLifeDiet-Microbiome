@@ -1,0 +1,1151 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+library(conflicted)
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+dlogis = function(x) {
+  rate = (Asym * exp(-(x - xmid) / scal)) / (scal * (1 + exp(-(x - xmid) / scal))^2)
+  return(rate)
+}
+hiroshige=c(met.brewer('Hiroshige')[c(1,4,6)],'#7DA4CA','#31475E')
+parseGLMs=function(models) { 
+glm.results=data.frame(
+    term=character(0),
+    estimate=numeric(0),
+    std.error=numeric(0),
+    statistic=numeric(0),
+    p.value=numeric(0),
+    formula=character(0),
+    message=character(0) 
+  )
+    for (i in seq_along(models)) { 
+      output=models[[i]]
+  tidy_output=broom::tidy(output)
+  formula=formula(output)
+  tidy_output$formula=paste(deparse(formula),collapse='')
+  tidy_output
+  tidy_output$message=names(models[i])
+  glm.results=bind_rows(glm.results,tidy_output)
+    }
+return(glm.results)
+}
+```
+
+```{r}
+# file paths
+parent=getwd()
+
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+```
+
+# 16S Unifrac
+## prep data and get unifrac distances
+```{r}
+gz <- "/Users/tjk30/Library/CloudStorage/Box-Box/project_davidlab/LAD_LAB_Personnel/Teresa_M/1_Infant-Metabarcoding/1_Mega-phyloseq-analysis/Analysis/ConstructPhylogeny"
+```
+
+```{r}
+ps.16S@sam_data$reads=sample_sums(ps.16S)
+
+ps.16S@sam_data$name=sample_names(ps.16S)
+ps.filt <- ps.16S %>%
+  subset_samples(!is.na(country)&reads>5000) %>%
+  prune_samples(sample_sums(.) > 0, .) %>%
+  tax_glom(taxrank = "Genus") %>% # Merge to genus level
+  filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE) %>% 
+  subset_taxa(!is.na(Genus)) 
+
+
+# Identify and handle duplicate genus names
+genus_names <- as.character(tax_table(ps.filt)[, "Genus"])
+unique_genus_names <- make.unique(genus_names, sep = "_")
+taxa_names(ps.filt) <- unique_genus_names
+
+ntaxa(ps.16S)
+ntaxa(ps.filt)
+rank_names(ps.16S)
+rank_names(ps.filt)
+
+taxdf <- ps.filt@tax_table %>%
+  data.frame()
+ps.filt
+```
+
+Open SILVA tree
+```{r}
+# Open the compressed tree file in binary mode
+setwd(gz)
+tree_file <- gzfile("tax_slv_ssu_138.1.tre.gz", "rb")
+taxmap_file <- gzfile("tax_slv_ssu_138.1.txt.gz", "rt")
+
+# Read the tree into R using the ape package
+phylo_tree <- read.tree(tree_file)
+ggtree(phylo_tree,layout='circular')
+
+taxmap <- read.delim(taxmap_file, header = FALSE)
+taxmap
+taxmap <- taxmap %>% 
+  mutate(V2 = as.character(V2)) # needed by left_join
+
+
+# Close the connection
+close(tree_file)
+close(taxmap_file)
+
+tree_df <- as.data.frame(phylo_tree$tip.label)
+tree_df <- tree_df %>% 
+  left_join(taxmap, by = c("phylo_tree$tip.label" = "V2")) %>%
+  select(-c("V4","V5")) %>%
+  dplyr::rename("ID"="phylo_tree$tip.label", "name"="V1", "taxa"="V3") %>%
+  mutate(label = str_extract(name, "[^;]+(?=;$)")) %>%
+  select(ID, label)
+tree_df
+
+phylo_tree$tip.label <- tree_df$label
+```
+ 
+ 
+Check all genera are in phylogenetic tree
+```{r}
+matches <- taxdf$Genus[taxdf$Genus %in% phylo_tree$tip.label]
+length(matches)
+length(taxdf$Genus)
+```
+
+
+Combine phyloseq and SILVA tree
+```{r}
+trimmed_tree <- keep.tip(phylo_tree, matches) # trim tree to only include genera represented in dataset
+ggtree(trimmed_tree,layout='circular')
+#Arbitrarily assign edge.length of 1 to all taxa
+if (is.null(trimmed_tree$edge.length) || length(trimmed_tree$edge.length) == 0) {
+  cat("The phylogenetic tree does not have branch lengths. Assigning arbitrary branch length = 1.\n")
+  trimmed_tree$edge.length <- rep(1, nrow(trimmed_tree$edge))
+}
+
+ggtree(trimmed_tree,layout='circular')
+ps <- merge_phyloseq(ps.filt, phy_tree(trimmed_tree))
+```
+
+
+```{r}
+saveRDS(ps,file='infant-16s-ps-wphylotree.rds')
+```
+
+```{r}
+library(doParallel)
+library(phyloseq)
+ps.filt=readRDS('infant-16s-ps-wphylotree.rds')
+
+unifrac_dist <- UniFrac(ps.filt, weighted = FALSE, normalized = TRUE, parallel = FALSE, fast = TRUE)
+unifrac_dist
+
+unifrac_dist_df <- as.data.frame(as.matrix(unifrac_dist))
+# Save the distance matrix to a CSV file
+write.csv(unifrac_dist_df, "unifrac_distance_matrix.csv", row.names = TRUE)
+```
+
+# Fig. S2.a
+```{r}
+# Read the distance matrix from the CSV file
+unifrac_dist_df <- read.csv("unifrac_distance_matrix.csv", row.names = 1)
+# Convert the data frame back to a distance matrix
+unifrac_dist <- as.dist(unifrac_dist_df)
+# Perform PCoA on the UniFrac distance matrix using vegan's cmdscale function
+ordination_result <- cmdscale(unifrac_dist, eig = TRUE, k = 2)
+
+ordination_scores <- ordination_result$points
+# Extract the coordinates for the first two dimensions
+ordination_df <- as.data.frame(ordination_result$points)
+
+ sample_data <- data.frame(ps.filt@sam_data)%>%
+   rownames_to_column(var='SampleID')%>%
+   select(SampleID,country,age_months)
+
+
+ordination_df$SampleID <- row.names(ordination_scores)
+ordination_df <- left_join(ordination_df, sample_data, by= "SampleID")
+colnames(ordination_df)[1:2] <- c("PCoA1", "PCoA2")
+
+pcoa=ordination_result
+pcoa_eigenvalues <- pcoa$eig
+
+# Calculate percent variation explained by the first two axes
+percent_variation <- (pcoa_eigenvalues / sum(pcoa_eigenvalues)) * 100
+percent_variation <- percent_variation[1:2]
+
+library(ggplot2)
+ggplot(ordination_df, aes(x = PCoA1, y = PCoA2, color = country)) +
+  geom_point(size = 3) +
+  labs(title = "Unweighted UniFrac", x = paste0("PCoA1 (",round(percent_variation[1],2),'% variance)'), y = paste0("PCoA2 (",round(percent_variation[2],2),'% variance)'),color='Country') +
+  theme_bw()+
+  scale_color_manual(values=hiroshige)
+
+ggsave('PCoA-16s-upto3.png')
+```
+
+
+## Envfit: age and country
+```{r}
+
+# Read the distance matrix from the CSV file
+unifrac_dist_df <- read.csv("unifrac_distance_matrix.csv", row.names = 1)
+# Convert the data frame back to a distance matrix
+unifrac_dist <- as.dist(unifrac_dist_df)
+# Perform PCoA on the UniFrac distance matrix using vegan's cmdscale function
+ordination_result <- cmdscale(unifrac_dist, eig = TRUE, k = 2)
+```
+
+```{r}
+sample_data=ps.filt%>%
+  .@sam_data%>%
+  data.frame()%>%
+  select(country,age_months)
+sample_data
+
+envfit_result <- vegan::envfit(ordination_result, sample_data, permutations = 999)
+
+# View and extract the R² values
+print(envfit_result)
+r_squared_values <- envfit_result$vectors$r
+
+# Calculate and print the percentage of variance explained
+percent_variance_explained <- r_squared_values * 100
+print(percent_variance_explained)
+
+# Extract the vectors and their R² values
+vectors <- envfit_result$vectors
+r_squared <- vectors$r^2
+
+# Calculate the variance explained by each variable for each dimension
+dim1_var_explained <- vectors$arrows[, 1]^2 * r_squared
+dim2_var_explained <- vectors$arrows[, 2]^2 * r_squared
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Variable = rownames(vectors$arrows),
+  Dim1_Var_Explained = dim1_var_explained * 100,
+  Dim2_Var_Explained = dim2_var_explained * 100
+)
+
+# Print the variance explained by each dimension for each variable
+print(var_explained_df)
+
+# Extract the centroids and goodness-of-fit for the factor variable
+factors <- envfit_result$factors
+centroids <- factors$centroids
+r_squared <- factors$r
+
+# Calculate the proportion of variance explained by each dimension for the categorical variable
+total_variance_explained <- r_squared[1] # since there's only one categorical variable
+
+dim1_var_explained <- sum(centroids[, 1]^2) / sum(centroids^2)
+dim2_var_explained <- sum(centroids[, 2]^2) / sum(centroids^2)
+
+# Convert to percentage
+dim1_var_explained_percent <- dim1_var_explained * total_variance_explained * 100
+dim2_var_explained_percent <- dim2_var_explained * total_variance_explained * 100
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Dimension = c("Dim1", "Dim2"),
+  Variance_Explained_Percent = c(dim1_var_explained_percent, dim2_var_explained_percent)
+)
+
+# Print the percentage of variance explained by each dimension for the categorical variable
+print(var_explained_df)
+```
+
+## Envfit: breastfeeding 
+```{r}
+ordination_result <- cmdscale(unifrac_dist, eig = TRUE, k = 2)
+
+sample_data=ps.filt%>%
+  .@sam_data%>%
+  data.frame()%>%
+  select(country,age_months,currently_breastfed,pFR)
+sample_data=sample_data[complete.cases(sample_data),]
+
+ordination_result$points <- ordination_result$points[rownames(ordination_result$points) %in% row.names(sample_data), , drop = FALSE]
+envfit_result <- vegan::envfit(ordination_result, sample_data, permutations = 999)
+
+# View and extract the R² values
+print(envfit_result)
+r_squared_values <- envfit_result$vectors$r
+
+# Calculate and print the percentage of variance explained
+percent_variance_explained <- r_squared_values * 100
+print(percent_variance_explained)
+
+# Extract the vectors and their R² values
+vectors <- envfit_result$vectors
+r_squared <- vectors$r^2
+
+# Calculate the variance explained by each variable for each dimension
+dim1_var_explained <- vectors$arrows[, 1]^2 * r_squared
+dim2_var_explained <- vectors$arrows[, 2]^2 * r_squared
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Variable = rownames(vectors$arrows),
+  Dim1_Var_Explained = dim1_var_explained * 100,
+  Dim2_Var_Explained = dim2_var_explained * 100
+)
+
+# Print the variance explained by each dimension for each variable
+print(var_explained_df)
+
+# Extract the centroids and goodness-of-fit for the factor variable
+factors <- envfit_result$factors
+centroids <- factors$centroids
+r_squared <- factors$r
+
+# Calculate the proportion of variance explained by each dimension for the categorical variable
+total_variance_explained <- r_squared[1] # since there's only one categorical variable
+
+dim1_var_explained <- sum(centroids[, 1]^2) / sum(centroids^2)
+dim2_var_explained <- sum(centroids[, 2]^2) / sum(centroids^2)
+
+# Convert to percentage
+dim1_var_explained_percent <- dim1_var_explained * total_variance_explained * 100
+dim2_var_explained_percent <- dim2_var_explained * total_variance_explained * 100
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Dimension = c("Dim1", "Dim2"),
+  Variance_Explained_Percent = c(dim1_var_explained_percent, dim2_var_explained_percent)
+)
+
+# Print the percentage of variance explained by each dimension for the categorical variable
+print(var_explained_df)
+sample_data
+```
+
+
+## Envfit: birth mode 
+```{r}
+ordination_result <- cmdscale(unifrac_dist, eig = TRUE, k = 2)
+
+sample_data=ps.filt%>%
+  .@sam_data%>%
+  data.frame()%>%
+  select(country,age_months,birth_mode,pFR)
+sample_data=sample_data[complete.cases(sample_data),]
+
+ordination_result$points <- ordination_result$points[rownames(ordination_result$points) %in% row.names(sample_data), , drop = FALSE]
+envfit_result <- vegan::envfit(ordination_result, sample_data, permutations = 999)
+
+# View and extract the R² values
+print(envfit_result)
+r_squared_values <- envfit_result$vectors$r
+
+# Calculate and print the percentage of variance explained
+percent_variance_explained <- r_squared_values * 100
+print(percent_variance_explained)
+
+# Extract the vectors and their R² values
+vectors <- envfit_result$vectors
+r_squared <- vectors$r^2
+
+# Calculate the variance explained by each variable for each dimension
+dim1_var_explained <- vectors$arrows[, 1]^2 * r_squared
+dim2_var_explained <- vectors$arrows[, 2]^2 * r_squared
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Variable = rownames(vectors$arrows),
+  Dim1_Var_Explained = dim1_var_explained * 100,
+  Dim2_Var_Explained = dim2_var_explained * 100
+)
+
+# Print the variance explained by each dimension for each variable
+print(var_explained_df)
+
+# Extract the centroids and goodness-of-fit for the factor variable
+factors <- envfit_result$factors
+centroids <- factors$centroids
+r_squared <- factors$r
+
+# Calculate the proportion of variance explained by each dimension for the categorical variable
+total_variance_explained <- r_squared[1] # since there's only one categorical variable
+
+dim1_var_explained <- sum(centroids[, 1]^2) / sum(centroids^2)
+dim2_var_explained <- sum(centroids[, 2]^2) / sum(centroids^2)
+
+# Convert to percentage
+dim1_var_explained_percent <- dim1_var_explained * total_variance_explained * 100
+dim2_var_explained_percent <- dim2_var_explained * total_variance_explained * 100
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Dimension = c("Dim1", "Dim2"),
+  Variance_Explained_Percent = c(dim1_var_explained_percent, dim2_var_explained_percent)
+)
+
+# Print the percentage of variance explained by each dimension for the categorical variable
+print(var_explained_df)
+sample_data
+```
+
+## Envfit: diet PCs
+```{r}
+ordination_result <- cmdscale(unifrac_dist, eig = TRUE, k = 2)
+sample_data=read.csv('pc.data.all.csv',row.names = 1)%>% # See: Fig. 4 for code
+  subset(row.names(.)%in%row.names(ordination_result$points))%>%
+  select(PC1_trnL,PC2_trnL,PC3_trnL,age_months,country)%>%
+  rownames_to_column()%>%
+  left_join(ps.filt@sam_data%>%data.frame()%>%select(age_months,country)%>%rownames_to_column(),by='rowname')%>%
+  mutate(age_months=coalesce(age_months.x,age_months.y),
+         country=coalesce(country.x,country.y))%>%
+  select(age_months,country,PC1_trnL,PC2_trnL,PC3_trnL,rowname)%>%
+  column_to_rownames()
+
+dim(sample_data)
+sample_data <- sample_data[complete.cases(sample_data), ]
+dim(sample_data)
+ordination_result$points <- ordination_result$points[rownames(ordination_result$points) %in% row.names(sample_data), , drop = FALSE]
+
+envfit_result <- vegan::envfit(ordination_result, sample_data, permutations = 999)
+
+# View and extract the R² values
+print(envfit_result)
+r_squared_values <- envfit_result$vectors$r
+
+# Calculate and print the percentage of variance explained
+percent_variance_explained <- r_squared_values * 100
+print(percent_variance_explained)
+
+# Extract the vectors and their R² values
+vectors <- envfit_result$vectors
+r_squared <- vectors$r^2
+
+# Calculate the variance explained by each variable for each dimension
+dim1_var_explained <- vectors$arrows[, 1]^2 * r_squared
+dim2_var_explained <- vectors$arrows[, 2]^2 * r_squared
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Variable = rownames(vectors$arrows),
+  Dim1_Var_Explained = dim1_var_explained * 100,
+  Dim2_Var_Explained = dim2_var_explained * 100
+)
+
+# Print the variance explained by each dimension for each variable
+print(var_explained_df)
+
+# Extract the centroids and goodness-of-fit for the factor variable
+factors <- envfit_result$factors
+centroids <- factors$centroids
+r_squared <- factors$r
+
+# Calculate the proportion of variance explained by each dimension for the categorical variable
+total_variance_explained <- r_squared[1] # since there's only one categorical variable
+
+dim1_var_explained <- sum(centroids[, 1]^2) / sum(centroids^2)
+dim2_var_explained <- sum(centroids[, 2]^2) / sum(centroids^2)
+
+# Convert to percentage
+dim1_var_explained_percent <- dim1_var_explained * total_variance_explained * 100
+dim2_var_explained_percent <- dim2_var_explained * total_variance_explained * 100
+
+# Combine results into a data frame
+var_explained_df <- data.frame(
+  Dimension = c("Dim1", "Dim2"),
+  Variance_Explained_Percent = c(dim1_var_explained_percent, dim2_var_explained_percent)
+)
+
+# Print the percentage of variance explained by each dimension for the categorical variable
+print(var_explained_df)
+```
+# S2.b) Microbiome/diet vs. age
+```{r}
+
+res=data.frame(country=character(),
+               plat=numeric())
+line_df=data.frame(country=character(),
+                   x=numeric(),
+                   y=numeric(),
+                   type=character())
+
+for (coun in c('Cambodia','Kenya','USA')) { # countries with sampling spanning ages 0-2
+d<-data.frame(ps.trnL@sam_data)%>%
+  subset(!is.na(age_months)&!is.na(pFR)&!is.na(Shannon_diversity))%>%
+  subset(country%in%c(coun))
+x <- d$age_months
+y <- as.numeric(d$pFR)
+
+fit <- nls(y ~ SSlogis(x, Asym, xmid, scal), 
+           data = d, 
+           start = list(Asym = max(as.numeric(y)), xmid = mean(x), scal = 1))
+summary(fit)
+# Generate predictions from the logistic growth curve
+pred_df <- data.frame(x = seq(min(x), max(x), length.out = 100))
+pred_df$y <- predict(fit, newdata = pred_df)
+pred_df$type='Plant Richness'
+pred_df$country=coun
+# Assume fit is your fitted model from nls()
+params <- coef(fit)
+
+# Extract parameters
+Asym <- params["Asym"]
+xmid <- params["xmid"]
+scal <- params["scal"]
+
+x_vals <- seq(min(d$age_months), max(d$age_months), length.out = 1000)
+y_vals=dlogis(x_vals)
+threshold_rate <- (max(y_vals) +min(y_vals))/2
+threshold_rate
+# Assuming a decreasing function after the maximum, find the first x where this occurs
+
+logis.df=data.frame(x=x_vals,
+                    y=y_vals)
+
+end_linear_phase=logis.df%>%
+  subset(y<threshold_rate)%>%
+  arrange(-y)%>%
+  dplyr::slice(1:2)%>%
+  .$x%>%
+  max()
+
+logis.df%>%
+  ggplot(aes(x=x,y=y))+geom_line()+theme_minimal()+geom_vline(xintercept = end_linear_phase, color='red')+ggtitle(paste(coun,'plant diversity'))
+line_df=bind_rows(line_df,pred_df)
+res=bind_rows(res,
+              data.frame(country=coun,
+                         plat=end_linear_phase,
+                         type='Plant Richness'))
+print(paste('in',coun,'the plateau point of plant diversity with respect to age is at',round(end_linear_phase),'months'))
+}
+```
+
+Repeat logistic line fitting, but for 16S
+```{r}
+for (coun in c('Cambodia','Kenya','USA')) {
+  d<-data.frame(ps.trnL@sam_data)%>%
+  subset(!is.na(age_months)&!is.na(pFR)&!is.na(Shannon_diversity))%>%
+  subset(country%in%c(coun))
+x <- d$age_months
+y <- as.numeric(d$Shannon_diversity)
+
+fit <- nls(y ~ SSlogis(x, Asym, xmid, scal), 
+           data = d, 
+           start = list(Asym = max(as.numeric(y)), xmid = mean(x), scal = 1))
+summary(fit)
+# Generate predictions from the logistic growth curve
+pred_df <- data.frame(x = seq(min(x), max(x), length.out = 100))
+pred_df$y <- predict(fit, newdata = pred_df)
+pred_df$type='Microbiome Diversity'
+pred_df$country=coun
+
+# Assume fit is your fitted model from nls()
+params <- coef(fit)
+
+# Extract parameters
+Asym <- params["Asym"]
+xmid <- params["xmid"]
+scal <- params["scal"]
+
+x_vals <- seq(min(d$age_months), max(d$age_months), length.out = 1000)
+y_vals=dlogis(x_vals)
+threshold_rate <- (max(y_vals) +min(y_vals))/2
+threshold_rate
+
+logis.df=data.frame(x=x_vals,
+                    y=y_vals)
+
+end_linear_phase=logis.df%>%
+  subset(y<threshold_rate)%>%
+  arrange(-y)%>%
+  dplyr::slice(1:2)%>%
+  .$x%>%
+  max() # there are 2 x values where the y=50% of its maximum, as the first derivative of the logistic line is a parabola. The higher x value represents the point at which the slope of the logistic line is decreasing.
+
+logis.df%>%
+  ggplot(aes(x=x,y=y))+geom_line()+theme_minimal()+geom_vline(xintercept = end_linear_phase, color='red')+ggtitle(paste(coun,'microbiome diversity'))
+line_df=bind_rows(line_df,pred_df)
+
+print(paste('in',coun,'the plateau point of microbiome diversity with respect to age is at',round(end_linear_phase),'months'))
+line_df=bind_rows(line_df,pred_df)
+res=bind_rows(res,
+              data.frame(country=coun,
+                         plat=end_linear_phase,
+                         type='Microbiome Diversity'))
+
+}
+```
+
+```{r}
+res
+```
+
+```{r}
+# add line breaks for plotting 
+line_df=line_df%>%
+   mutate(type=ifelse(type=='Plant Richness','Plant\nRichness\n(pFR)','Microbiome\n\u03B1 Diversity\n(Shannon)'))
+
+res=res%>%
+   mutate(type=ifelse(type=='Plant Richness','Plant\nRichness\n(pFR)','Microbiome\n\u03B1 Diversity\n(Shannon)'))
+
+```
+
+```{r}
+d<-data.frame(ps.trnL@sam_data)%>%
+  subset(!is.na(age_months)&!is.na(Shannon_diversity))
+d%>%
+  pivot_longer(c(Shannon_diversity,pFR),names_to = 'type',values_to = 'richness')%>%
+   mutate(type=ifelse(type=='pFR','Plant\nRichness\n(pFR)','Microbiome\n\u03B1 Diversity\n(Shannon)'))%>%
+ggplot(aes(x = age_months, y = richness,color=country)) +
+  geom_jitter(alpha=0.5) +  # Scatter plot of original data
+  geom_line(data = line_df, aes(x = x, y = y, group=interaction(country,type)), color = "blue", size = .8,alpha=0.8) +  # Line plot of logistic growth curve
+  xlab("Age (Months)") +
+  ylab("Diversity") +
+  theme_bw() +
+  ylab("")+
+  facet_grid(type~country,scales='free_y',switch='y')+
+  scale_color_manual(values=hiroshige)+
+  geom_vline(data = res, aes(xintercept = plat), linetype = "dashed", color = "red")+ 
+  labs(color='Country')+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.placement = "outside",              
+  axis.text.y.left = element_text(margin = margin(r = 5)),  
+  axis.ticks.y.left = element_line(),         
+  axis.line.y.left = element_line(),    
+        strip.background = element_blank(),      
+        text = element_text(family = "Arial",
+                            face='bold',
+                            size=22),
+        axis.text = element_text(face='plain',size=14,family='Arial'),
+        legend.position = 'none')
+ggsave('shannon-pmr-vs-age-logistic-curve-coloredCountry.png',
+       height=4.5,
+       width=9)
+```
+
+
+#  Shannon vs pFR
+### S2.c) within country
+```{r}
+data=data.frame(ps.trnL@sam_data)%>%
+  mutate(Country=country)%>%
+  subset(!is.na(Shannon_diversity))
+countries <- c('USA', 'Cambodia', 'Nicaragua','Kenya','Pakistan')
+
+# Initialize an empty data frame to store results
+results_df <- data.frame(country = character(),
+                         intercept = numeric(),
+                         slope_pFR = numeric(),
+                         slope_age_months = numeric(),
+                         stringsAsFactors = FALSE)
+
+for (coun in countries) {
+  if (coun%in%c('USA','Kenya')) {model=glm(Shannon_diversity ~ pFR + age_months, data = filter(data, Country == coun), family = 'gaussian') 
+  coefficients <- coef(model)
+  slope_age_months = coefficients["age_months"]
+    p_value_age_months=summary(model)$coefficients["age_months", 4]
+  coeff_bf=NA
+  pvalue_bf=NA} 
+  if (coun%in%c('Pakistan')) {
+    model=glm(Shannon_diversity ~ pFR, data = filter(data, Country == coun), family = 'gaussian') 
+  coefficients <- coef(model)
+  slope_age_months = 0
+    p_value_age_months=NA
+  coeff_bf=NA
+  pvalue_bf=NA
+  }
+  if (coun%in%c('Cambodia','Nicaragua')){
+    model <-glm(Shannon_diversity ~pFR + currently_breastfed + age_months + currently_breastfed:age_months + pFR:currently_breastfed, data = filter(data, Country == coun), family = 'gaussian')
+    coefficients <- coef(model)
+    coeff_bf=coefficients["currently_breastfedYes"]
+    pvalue_bf=summary(model)$coefficients["currently_breastfedYes", 4]
+    p_value_age_months=summary(model)$coefficients["age_months", 4]
+    slope_age_months = coefficients["age_months"]
+  }
+  print(coun)
+  print(summary(model))
+
+    # Append to the results data frame
+    results_df <- rbind(results_df, data.frame(country = coun,
+                                               intercept = coefficients[1],
+                                               slope_pFR = coefficients["pFR"],
+                                               
+                                               coeff_breastfed= coeff_bf,
+                                               p_value_breastfed=pvalue_bf,
+                                               p_value_pFR=summary(model)$coefficients["pFR", 4],
+                                               slope_age_months = slope_age_months,
+                                              p_value_age_months=p_value_age_months))
+}
+
+
+x_values <- seq(from = 0, to = max(data$pFR, na.rm = TRUE), by = 1)
+
+# Expand grid of countries and x values
+line_data_long <- results_df %>%
+  select(country, intercept, slope_pFR, slope_age_months) %>%
+  crossing(x = x_values) %>%
+  mutate(
+    y_pFR = intercept + slope_pFR * x,
+    y_age_months = intercept + slope_age_months * x
+  ) %>%
+  dplyr::rename(Country = country)%>%
+  pivot_longer(cols = starts_with("y_"), names_to = "line_type", values_to = "y_value") %>%
+  mutate(
+    Variable = recode(
+      str_remove(line_type, "y_"),
+      pFR = "pFR",
+      age_months = "Age (months)"
+    )
+  )
+
+p_values_df <- results_df %>%
+  pivot_longer(cols = c(p_value_pFR, p_value_age_months, p_value_breastfed),
+               names_to = "variable", values_to = "p.value") %>%
+  mutate(
+    p.adjust = p.adjust(p.value, method = "BH"),
+    variable = str_remove(variable, "p_value_"),
+    variable = recode(variable,
+                      pFR = "pFR",
+                      age_months = "Age (months)",
+                      breastfed = "Breastfed"),
+    sig = case_when(p.adjust >= 0.1 ~ 'NS',
+                  p.adjust < 0.1 & p.adjust >= 0.05~ ".",
+                  p.adjust < 0.05 & p.adjust >= 0.01~ "*",
+                  p.adjust < 0.01 & p.adjust >= 0.001~ "**",
+                  p.adjust < 0.001 ~ "***"),
+    significance_caption = paste0(variable, ": ", sig)
+  ) %>%
+  group_by(country) %>%
+  summarise(
+    significance_caption = paste(significance_caption, collapse = "\n"),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(Country = country)
+
+
+data$age_percentile=data$age_months/24
+data$age_percentile[data$age_months>24]=30/24 # cap age range, set any samples that fall above 24mo to 24mo+6mo (keep scale consistent)
+specific_values <- c(0,6,12,18,24)
+interpolated_percentiles <- approx(x = data$age_months, y = data$age_percentile, xout = specific_values, method = "linear")
+
+# Show results
+interpolated_results <- data.frame(
+  age = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+interpolated_results
+breaks=interpolated_results$Interpolated_Percentile
+labels=interpolated_results$age
+colours<-met.brewer('Hokusai3',length(breaks))
+r<-range(data$age_percentile)
+
+line_data_long.noage=line_data_long%>%
+  subset(Variable=='pFR') # only plot pFR line
+line_data_long.noage
+data%>%
+ggplot(aes(x = pFR, y = Shannon_diversity)) +
+  geom_point(aes(color = age_percentile)) +  # Plot points
+  facet_wrap(~Country, nrow= 1) +  # Adjust ncol as needed
+  geom_text(data = unique(p_values_df[, c("Country", "significance_caption")]),
+            aes(label = significance_caption, x = Inf, y = Inf),
+            hjust = 1.1, vjust = 1.1, check_overlap = TRUE, size = 3) +
+  theme_bw() +
+  geom_line(data = line_data_long.noage, aes(x = x, y = y_value, group = Country)) + 
+  labs(x = "Plant Richness (pFR)", y = "Microbiome\n\u03B1 Diversity\n(Shannon)", color = "Age (months)") +
+  theme(strip.background = element_rect(fill = "white"),
+        legend.position = 'none',
+        text = element_text(family = "Arial",size=14,face='bold'),
+        axis.text = element_text(face='plain',size=12,family='Arial'))+
+  scale_color_gradientn(limits  = r,
+    colours = colours[c(1, seq_along(colours), length(colours))],
+    labels=labels,
+    breaks=breaks,
+    values  = c(0, scales::rescale(breaks, from = r), 1))+ylim(0,7)
+ggsave('3_16s-shannon-vs-pFR-foods_byCountry.png',
+       height=3)
+
+```
+
+### S2.d) across country
+```{r}
+data=data.frame(ps.trnL@sam_data)%>%
+  mutate(Country=country)%>%
+  subset(!is.na(Shannon_diversity))
+model=glm(Shannon_diversity ~ pFR + country + age_months + country:age_months + pFR:country, data = data, family = 'gaussian')
+summary(model)
+res=parseGLMs(list(model))
+res
+PC='pFR'
+results_df <- data.frame(intercept = res$estimate[res$term=='(Intercept)'],
+                                               slope_PC = res$estimate[res$term==PC],
+                                               slope_age_months = res$estimate[res$term=='age_months'],
+                                               p_value_PC=res$p.value[res$term==PC],
+                                              p_value_age_months=res$p.value[res$term=='age_months'])
+
+  
+x_values <- seq(from = min(data[PC]), to = max(data[PC]), by = 1)
+
+# Create an empty data frame for line data
+line_data <- data.frame(x = numeric(),
+                        y_PC = numeric(),
+                        y_age_months = numeric(),
+                        stringsAsFactors = FALSE)
+
+line_data <- tibble(x = x_values) %>%
+  mutate(
+    y_PC = results_df$intercept[1] + results_df$slope_PC[1] * x,
+    y_age_months = results_df$intercept[1] + results_df$slope_age_months[1] * x
+  ) %>%
+  dplyr::rename(y_pFR = y_PC)
+
+# Reshape and label variables
+line_data_long <- line_data %>%
+  pivot_longer(cols = starts_with("y_"), names_to = "line_type", values_to = "y_value") %>%
+  mutate(Variable = case_when(
+    line_type == "y_pFR" ~ "pFR",
+    line_type == "y_age_months" ~ "Age (months)"
+  ))
+
+
+d=data.frame(PC=data[PC],
+             cluster=data$Shannon_diversity,
+             age_months=data$age_months)
+d
+
+d$PC=d[,1]
+d$cluster=d[,2]
+
+d$age_percentile=d$age_months/24
+d$age_percentile[d$age_months>24]=30/24 # cap age range, set any samples that fall above 24mo to 24mo+6mo (keep scale consistent)
+specific_values <- c(0,6,12,18,24)
+interpolated_percentiles <- approx(x = d$age_months, y = d$age_percentile, xout = specific_values, method = "linear")
+
+# Show results
+interpolated_results <- data.frame(
+  age = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+breaks=interpolated_results$Interpolated_Percentile
+labels=interpolated_results$age
+colours<-met.brewer('Hokusai3',length(breaks))
+r<-range(d$age_percentile)
+
+
+pc.pvalue=results_df$p_value_PC
+age.pvalue=results_df$p_value_age_months
+cap=paste("p=",
+              paste0(round(pc.pvalue,digits=4),
+                     case_when(pc.pvalue<0.05 &pc.pvalue>0.01 ~ "*",
+                               pc.pvalue <0.01&pc.pvalue>0.001 ~ "**",
+                               pc.pvalue <0.001 ~ "***",
+                               pc.pvalue >= 0.05 ~ "")))
+
+line_data_long.noage=line_data_long%>%
+  subset(Variable=='pFR')
+line_data_long.noage
+
+plot=ggplot(data=d,aes(x = PC, y = cluster)) +
+  geom_point(aes(color=age_percentile)) +  # Plot points  
+  theme_bw() +
+  geom_line(data = line_data_long.noage, aes(x = x, y = y_value)) +
+  labs(x = 'Plant Richness (pFR)', y = 'Microbiome \u03B1 Diversity (Shannon)') +
+  annotate("text",
+           label = cap,  # "p = 0.001", for example
+           x = Inf, y = -Inf,
+           hjust = 1.1, vjust = -2,
+           size = 6, fontface = "bold", family = "Arial")+
+  theme(strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial"))+
+  labs(color='Age (months)')+
+  scale_color_gradientn(
+    colours = colours[c(1, seq_along(colours), length(colours))],
+    limits=r,
+  labels=labels,
+  breaks = breaks)+ theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        legend.position = 'none',
+        text = element_text(family = "Arial",
+                            size=18,
+                            face='bold'),
+        axis.text = element_text(face='plain',size=14,family='Arial'))
+print(plot)
+ggsave('3_pfr-vs-16s-shannon.png',
+       height=5,
+       width=5)
+```
+
+
+# 16S Richness vs. pMR 
+
+## S2.e) across country
+```{r}
+data=data.frame(ps.trnL@sam_data)%>%
+  mutate(Country=country)%>%
+  subset(!is.na(richness_16S))
+model=glm(richness_16S ~ pFR + country + age_months + country:age_months + pFR:country, data = data, family = 'gaussian')
+summary(model)
+res=parseGLMs(list(model))
+res
+PC='pFR'
+results_df <- data.frame(intercept = res$estimate[res$term=='(Intercept)'],
+                                               slope_PC = res$estimate[res$term==PC],
+                                               slope_age_months = res$estimate[res$term=='age_months'],
+                                               p_value_PC=res$p.value[res$term==PC],
+                                              p_value_age_months=res$p.value[res$term=='age_months'])
+
+  
+x_values <- seq(from = min(data[PC]), to = max(data[PC]), by = 1)
+
+# Create an empty data frame for line data
+line_data <- data.frame(x = numeric(),
+                        y_PC = numeric(),
+                        y_age_months = numeric(),
+                        stringsAsFactors = FALSE)
+
+for(x in x_values) {
+    # Calculate y-values based on intercept and slope for pFR and age_months
+    y_PC <- results_df$intercept[1] + results_df$slope_PC[1] * x
+    y_age_months <- results_df$intercept[1] + results_df$slope_age_months[1] * x
+    
+    # Append to line_data
+    line_data <- rbind(line_data, data.frame(x = x,
+                                             y_pFR = y_PC,
+                                             y_age_months = y_age_months 
+                                             )
+                                             )
+  }
+
+
+line_data_long <- line_data %>%
+  gather(key = "line_type", value = "y_value", -x) %>%
+  transform(Variable = sub("y_", "", line_type))
+line_data_long
+line_data_long$Variable[line_data_long$Variable=='age_months']='Age (months)'
+line_data_long$Variable[line_data_long$Variable=='pFR']='pFR'
+#line_data_long=line_data_long[!(line_data_long$x<0&line_data_long$Variable=='Age (months)'),] # remove part of line for negative ages
+
+d=data.frame(PC=data[PC],
+             cluster=data$richness_16S,
+             age_months=data$age_months)
+d
+
+d$PC=d[,1]
+d$cluster=d[,2]
+
+d$age_percentile=d$age_months/24
+d$age_percentile[d$age_months>24]=30/24 # cap age range, set any samples that fall above 24mo to 24mo+6mo (keep scale consistent)
+specific_values <- c(0,6,12,18,24)
+interpolated_percentiles <- approx(x = d$age_months, y = d$age_percentile, xout = specific_values, method = "linear")
+
+# Show results
+interpolated_results <- data.frame(
+  age = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+breaks=interpolated_results$Interpolated_Percentile
+labels=interpolated_results$age
+colours<-met.brewer('Hokusai3',length(breaks))
+r<-range(d$age_percentile)
+
+
+pc.pvalue=results_df$p_value_PC
+age.pvalue=results_df$p_value_age_months
+cap=paste("p=",
+              paste0(round(pc.pvalue,digits=4),
+                     case_when(pc.pvalue<0.05 &pc.pvalue>0.01 ~ "*",
+                               pc.pvalue <0.01&pc.pvalue>0.001 ~ "**",
+                               pc.pvalue <0.001 ~ "***",
+                               pc.pvalue >= 0.05 ~ "")))
+line_data_long=line_data_long%>%
+  subset(Variable=='pFR')
+d
+plot=ggplot(data=d,aes(x = PC, y = cluster)) +
+  geom_point(aes(color=age_percentile)) +  # Plot points  
+  theme_bw() +
+  geom_line(data = line_data_long, aes(x = x, y = y_value)) +
+  labs(x = 'Plant Richness (pFR)', y = 'Microbiome \u03B1 Diversity (Richness)') +
+  theme(strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial"))+
+  annotate("text",
+           label = cap,  # "p = 0.001", for example
+           x = Inf, y = -Inf,
+           hjust = 1.1, vjust = -2,
+           size = 6, fontface = "bold", family = "Arial")+
+  labs(color='Age (months)')+
+  scale_color_gradientn(
+    colours = colours[c(1, seq_along(colours), length(colours))],
+    limits=r,
+  labels=labels,
+  breaks = breaks)+ 
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",
+                            size=18,
+                            face='bold'),
+        legend.position = 'none')
+print(plot)
+ggsave('3_pfr-vs-16s-richness.png',
+       height=5,
+       width=5)
+```
+## S2.f) within country
+```{r}
+data=data.frame(ps.trnL@sam_data)%>%
+  mutate(Country=country)%>%
+  subset(!is.na(richness_16S))
+countries <- c('USA', 'Cambodia', 'Nicaragua','Kenya','Pakistan')
+
+# Initialize an empty data frame to store results
+results_df <- data.frame(country = character(),
+                         intercept = numeric(),
+                         slope_pFR = numeric(),
+                         slope_age_months = numeric(),
+                         stringsAsFactors = FALSE)
+
+for (coun in countries) {
+  if (coun%in%c('USA','Kenya')) {model=glm(richness_16S ~ pFR + age_months, data = filter(data, Country == coun), family = 'gaussian') 
+  coefficients <- coef(model)
+  slope_age_months = coefficients["age_months"]
+    p_value_age_months=summary(model)$coefficients["age_months", 4]
+  coeff_bf=NA
+  pvalue_bf=NA} 
+  if (coun%in%c('Pakistan')) {
+    model=glm(richness_16S ~ pFR, data = filter(data, Country == coun), family = 'gaussian') 
+  coefficients <- coef(model)
+  slope_age_months = 0
+    p_value_age_months=NA
+  coeff_bf=NA
+  pvalue_bf=NA
+  }
+  if (coun%in%c('Cambodia','Nicaragua')){
+    model <-glm(richness_16S ~pFR + currently_breastfed + age_months + currently_breastfed:age_months + pFR:currently_breastfed, data = filter(data, Country == coun), family = 'gaussian')
+    coefficients <- coef(model)
+    coeff_bf=coefficients["currently_breastfedYes"]
+    pvalue_bf=summary(model)$coefficients["currently_breastfedYes", 4]
+    p_value_age_months=summary(model)$coefficients["age_months", 4]
+    slope_age_months = coefficients["age_months"]
+  }
+  print(coun)
+  print(summary(model))
+
+    # Append to the results data frame
+    results_df <- rbind(results_df, data.frame(country = coun,
+                                               intercept = coefficients[1],
+                                               slope_pFR = coefficients["pFR"],
+                                               
+                                               coeff_breastfed= coeff_bf,
+                                               p_value_breastfed=pvalue_bf,
+                                               p_value_pFR=summary(model)$coefficients["pFR", 4],
+                                               slope_age_months = slope_age_months,
+                                              p_value_age_months=p_value_age_months))
+}
+
+
+x_values <- seq(from = 0, to = max(data$pFR, na.rm = TRUE), by = 1)
+
+# Expand grid of countries and x values
+line_data_long <- results_df %>%
+  select(country, intercept, slope_pFR, slope_age_months) %>%
+  crossing(x = x_values) %>%
+  mutate(
+    y_pFR = intercept + slope_pFR * x,
+    y_age_months = intercept + slope_age_months * x
+  ) %>%
+  dplyr::rename(Country = country)%>%
+  pivot_longer(cols = starts_with("y_"), names_to = "line_type", values_to = "y_value") %>%
+  mutate(
+    Variable = recode(
+      str_remove(line_type, "y_"),
+      pFR = "pFR",
+      age_months = "Age (months)"
+    )
+  )
+
+p_values_df <- results_df %>%
+  pivot_longer(cols = c(p_value_pFR, p_value_age_months, p_value_breastfed),
+               names_to = "variable", values_to = "p.value") %>%
+  mutate(
+    p.adjust = p.adjust(p.value, method = "BH"),
+    variable = str_remove(variable, "p_value_"),
+    variable = recode(variable,
+                      pFR = "pFR",
+                      age_months = "Age (months)",
+                      breastfed = "Breastfed"),
+    sig = case_when(p.adjust >= 0.1 ~ 'NS',
+                  p.adjust < 0.1 & p.adjust >= 0.05~ ".",
+                  p.adjust < 0.05 & p.adjust >= 0.01~ "*",
+                  p.adjust < 0.01 & p.adjust >= 0.001~ "**",
+                  p.adjust < 0.001 ~ "***"),
+    significance_caption = paste0(variable, ": ", sig)
+  ) %>%
+  group_by(country) %>%
+  summarise(
+    significance_caption = paste(significance_caption, collapse = "\n"),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(Country = country)
+
+
+data$age_percentile=data$age_months/24
+data$age_percentile[data$age_months>24]=30/24 # cap age range, set any samples that fall above 24mo to 24mo+6mo (keep scale consistent)
+specific_values <- c(0,6,12,18,24)
+interpolated_percentiles <- approx(x = data$age_months, y = data$age_percentile, xout = specific_values, method = "linear")
+
+# Show results
+interpolated_results <- data.frame(
+  age = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+interpolated_results
+breaks=interpolated_results$Interpolated_Percentile
+labels=interpolated_results$age
+colours<-met.brewer('Hokusai3',length(breaks))
+r<-range(data$age_percentile)
+
+line_data_long.noage=line_data_long%>%
+  subset(Variable=='pFR') # only plot pFR line
+line_data_long.noage
+data%>%
+ggplot(aes(x = pFR, y = richness_16S)) +
+  geom_point(aes(color = age_percentile)) +  # Plot points
+  facet_wrap(~Country, nrow= 1) +  # Adjust ncol as needed
+  geom_text(data = unique(p_values_df[, c("Country", "significance_caption")]),
+            aes(label = significance_caption, x = Inf, y = Inf),
+            hjust = 1.1, vjust = 1.1, check_overlap = TRUE, size = 3) +
+  theme_bw() +
+  geom_line(data = line_data_long.noage, aes(x = x, y = y_value, group = Country)) + 
+  labs(x = "Plant Richness (pFR)", y = "Microbiome\n\u03B1 Diversity\n(Richness)", color = "Age (months)") +
+  theme(strip.background = element_rect(fill = "white"),
+        legend.position = 'none',
+        text = element_text(family = "Arial",size=14,face='bold'),
+        axis.text = element_text(face='plain',size=12,family='Arial'))+
+  scale_color_gradientn(limits  = r,
+    colours = colours[c(1, seq_along(colours), length(colours))],
+    labels=labels,
+    breaks=breaks,
+    values  = c(0, scales::rescale(breaks, from = r), 1))
+ggsave('3_16s-richness-vs-pFR-foods_byCountry.png',
+       height=3)
+
+```

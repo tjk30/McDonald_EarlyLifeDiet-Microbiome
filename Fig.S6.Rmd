@@ -1,0 +1,383 @@
+---
+title: "Fig. S6"
+output: html_notebook
+---
+
+# Setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+library(conflicted)
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+
+parseGLMs=function(models) { 
+glm.results=data.frame(
+    term=character(0),
+    estimate=numeric(0),
+    std.error=numeric(0),
+    statistic=numeric(0),
+    p.value=numeric(0),
+    formula=character(0),
+    message=character(0) 
+  )
+    for (i in seq_along(models)) { 
+      output=models[[i]]
+  tidy_output=broom::tidy(output)
+  formula=formula(output)
+  tidy_output$formula=paste(deparse(formula),collapse='')
+  tidy_output
+  tidy_output$message=names(models[i])
+  glm.results=bind_rows(glm.results,tidy_output)
+    }
+return(glm.results)
+}
+
+```
+
+## Open data
+
+```{r}
+# file paths
+parent=getwd()
+
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+ps.16S
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+
+```
+
+```{r}
+data_renamed=read.csv('../Fig.4/cluster-df.csv',row.names = 1)
+data_all=read.csv('../Fig.4/pc.data.all.csv',row.names = 1) %>%
+  rownames_to_column()%>%
+  mutate(rowname=gsub('-|_| ','\\.',rowname))%>% # synchronize rownames for merging
+  column_to_rownames()%>%
+  merge(data_renamed,by=0,all.x=TRUE)%>%
+  column_to_rownames(var='Row.names')
+```
+
+## rarefied pMR
+```{r}
+ps.rare=rarefy_even_depth(ps.trnL,sample.size = 500,rngseed = 123) # this will drop samples below 500 reads
+
+ps.rare@sam_data$pFR_rarefied=ifelse(subset_taxa(ps.rare,!is.na(superkingdom))@otu_table>0,1,0) %>%  # count food if >0 reads
+  rowSums()
+
+p=ps.rare@sam_data%>%
+  data.frame()%>%
+  select(pFR_rarefied)%>%
+  rownames_to_column()%>%
+  mutate(rowname=gsub('-|_| ','\\.',rowname))
+p
+
+pc.data.all=data_all%>%
+  rownames_to_column()%>%
+  merge(p,by='rowname')
+pc.data.all
+```
+
+```{r}
+vars=c('pFR_rarefied')
+models=list()
+for (clus in c("cluster9", "cluster5", "cluster1", "Shannon_diversity", "richness_16S")) {
+  for (var in vars) {
+
+    # Subset data where variable is not NA
+    data <- pc.data.all[!is.na(pc.data.all[[var]]), ]
+
+    # Define formula based on number of countries in the data
+    if (length(unique(data$country)) > 1) {
+      coun <- 'global'
+      formula <- as.formula(paste0(
+        clus, " ~ age_months + country + country:age_months + ",
+        var, " + country:", var, " + age_months:", var
+      ))
+
+    } else {
+      coun <- data$country[1]
+
+      if (coun %in% c('USA', 'Kenya', 'Pakistan')) {
+        formula <- as.formula(paste0(
+          clus, " ~ age_months + ", var, " + age_months:", var
+        ))
+
+      } else if (coun %in% c('Cambodia', 'Nicaragua')) {
+        formula <- as.formula(paste0(
+          clus, " ~ age_months + currently_breastfed + age_months:currently_breastfed + ",
+          var, " + age_months:", var, " + currently_breastfed:", var
+        ))
+      } else {
+        # Handle unexpected country
+        warning(paste("Country", coun, "not handled. Skipping."))
+        next
+      }
+    }
+
+    # Fit the model and store it
+    models[[paste(var, clus, coun)]] <- glm(formula, data = data, family = "gaussian")
+  }
+}
+
+
+# also run within country
+for (clus in c( 
+  "cluster9", # early
+  "cluster5", # late
+  "cluster1", # Transitional Microbiome
+  "Shannon_diversity",
+  "richness_16S"
+  )) {
+  for (var in vars) { 
+    data=pc.data.all[!is.na(pc.data.all[var]),] 
+    data
+    if (length(unique(data$country))<2) { next} # skip country specific PCs since already accounted for those
+    for (coun in c('Kenya','USA','Cambodia','Nicaragua','Pakistan')) { 
+      if (coun%in%c('USA','Kenya','Pakistan')) {
+        formula = as.formula(paste0(clus,"~ age_months+",var,"+age_months:",var))}
+      if (coun%in%c('Cambodia','Nicaragua')){
+    formula = as.formula(paste0(clus,"~ age_months+currently_breastfed+age_months:currently_breastfed+",var,"+age_months:",var,"+currently_breastfed:",var)) }
+      models[[paste(var,clus,coun)]] <- glm(formula, data = filter(data,country==coun), family = "gaussian") # Adjust family as needed
+    }
+  }
+}
+
+```
+
+```{r}
+extract_glm_results <- function(model, model_name) {
+  tidy_model <- broom::tidy(model, conf.int = TRUE)
+  tidy_model$model <- model_name
+  return(tidy_model)
+}
+
+
+# Extract results for all models
+results_list <- lapply(names(models), function(model_name) {
+  extract_glm_results(models[[model_name]], model_name)
+})
+```
+
+```{r}
+# Combine results into a single data frame
+
+results_df <- bind_rows(results_list) %>%
+  separate(model, into = c("Predictor", "Outcome", "country"), sep = " ") %>%
+  group_by(Outcome) %>%
+  mutate(
+    p.adjust = p.adjust(p.value, method = "BH"),
+    
+    Predictor_clean = case_when(
+      Predictor == "nourish_group" ~ "Intervention Group",
+      Predictor == "NOURISH_group_binary" ~ "Nutrition Intervention",
+      Predictor == "diarrhea" ~ "Diarrhea",
+      Predictor == "WHZ" ~ "Weight-for-height z score",
+      Predictor == "RUTF" ~ "Ready to use therapeutic food",
+      Predictor == "pFR_rarefied" ~ "pFR (Rarefied data)",
+      TRUE ~ Predictor
+    ),
+    
+    term_clean = term %>%
+      str_replace_all(c(
+        "pMR_foods" = "pFR",
+        "received_nutrition_rutfYes" = "Received RUTF",
+        "NOURISH_groupControl" = "Control Group",
+        "NOURISH_groupNutrition-only" = "Nutrition Group",
+        "NOURISH_groupSanitation-only" = "Sanitation Group",
+        "NOURISH_groupCombined" = "Combined Group",
+        "NOURISH_group_binaryYes" = "Nutrition Intervention",
+        "diarrheaYes" = "YesDiarrhea",
+        "age_months" = "Age (Months)",
+        "currently_breastfedYes" = "Breastfed",
+        "pFR_rarefied" = "pFR (Rarefied Data)"
+      ))
+  )
+
+unique(results_df$term_clean)
+
+```
+
+# S6.a) 
+```{r}
+results_df%>%
+  subset(term_clean=='pFR (Rarefied Data)'&country!='Pakistan')%>%
+  mutate(country=factor(ifelse(country=='global','Global',country),levels=rev(c('Global','Cambodia','USA','Kenya','Nicaragua','Pakistan'))),
+         Outcome=case_when(Outcome =='cluster9' ~ 'Early\nMicrobiome',
+                           Outcome=='cluster5' ~ 'Late\nMicrobiome',
+                           Outcome=='cluster1' ~ 'Transitional\nMicrobiome',
+                           Outcome=='richness_16S' ~ 'Microbiome Diversity\n(Richness)',
+                           Outcome=='Shannon_diversity' ~ 'Microbiome Diversity\n(Shannon)',
+                           TRUE ~ Outcome),
+         significance=case_when(p.adjust<0.05~'p.adjust<0.05',
+                                p.value<0.05 ~ 'p.value <0.05',
+                                TRUE ~ 'NS'))%>%
+  mutate(Outcome=factor(Outcome,levels=c('Microbiome Diversity\n(Richness)','Microbiome Diversity\n(Shannon)','Early\nMicrobiome','Transitional\nMicrobiome','Late\nMicrobiome')))%>%
+ggplot(aes(y = country, x = estimate,color=significance)) +
+  geom_vline(xintercept = 0,linetype='dashed')+
+  geom_point(size=2) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.2) +
+  theme_bw() +
+  labs(title = "pFR (Rarefied Data)",
+       x = "Coefficient (pFR Rarefied)",
+       y = "",
+       color='Significance') +
+   geom_point() +
+  scale_color_manual(values=c('#5C5C5C',met.brewer('Hokusai3',3)[c(1,2)]))+
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.2) +
+  facet_grid(~Outcome,scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y=element_blank(),
+        legend.position = 'none',
+        panel.grid.minor.x = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",size=15,color='black'))
+ggsave('pFR-rarefied-glm.png',
+       height=3,
+       width=10)
+```
+
+```{r}
+data_all
+```
+
+# afr
+```{r}
+ps=ps.12sv5%>%
+   subset_taxa(., species!='Homo sapiens') 
+ps@sam_data$aFR=ifelse(ps@otu_table>0,1,0) %>%  # count food if >0 reads
+  rowSums()
+
+aFR=ps@sam_data%>%
+  data.frame()%>%
+  select(aFR)%>%
+  rownames_to_column()%>%
+  mutate(rowname=gsub('-|_| ','\\.',rowname))%>%
+    column_to_rownames()
+aFR
+
+pc.data.all=data_all%>%
+  merge(aFR,by=0,all=TRUE)%>%
+  column_to_rownames(var='Row.names')
+
+vars=c('aFR')
+
+models <- list()
+pc.data.all[!is.na(pc.data.all[var]),]
+for (clus in c( # only going to test the clusters that I'm interested in: early + late clusters, Transitional Microbiome, and I'll throw in the transitional bifido as well
+  "cluster9", # early
+  "cluster5", # late
+  "cluster1", # Transitional Microbiome
+  "richness_16S",
+  "Shannon_diversity") 
+  ) {
+  for (var in vars) { 
+    data=pc.data.all[!is.na(pc.data.all[var]),] # subset to data with var (important for country specific)
+    if (length(unique(data$country))>1) {
+      coun='global'
+      formula=as.formula(paste0(clus,"~ age_months+country+country:age_months+",var,"+country:",var,"+age_months:",var)) }
+    if (length(unique(data$country))<2) {
+      coun=data$country[1]
+      if (coun%in%c('USA','Kenya','Pakistan')) {
+        formula = as.formula(paste0(clus,"~ age_months+",var,"+age_months:",var))}
+  if (coun%in%c('Cambodia','Nicaragua')){
+    formula = as.formula(paste0(clus,"~ age_months+currently_breastfed+age_months:currently_breastfed+",var,"+age_months:",var,"+currently_breastfed:",var)) }}
+  models[[paste(clus,var,coun)]] <- glm(formula, data = data, family = "gaussian") # Adjust family as needed
+  }
+}
+
+# also run pFR, aMR, PC1 within country
+for (clus in c( 
+  "cluster9", # early
+  "cluster5", # late
+  "cluster1",# Transitional Microbiome
+  "richness_16S",
+  "Shannon_diversity"
+  )) {
+  for (var in vars) { 
+    data=pc.data.all[!is.na(pc.data.all[var]),] 
+    data
+    if (length(unique(data$country))<2) { next} # skip country specific PCs since already accounted for those
+    for (coun in c('Kenya','USA','Cambodia','Nicaragua','Pakistan')) { 
+      if (coun%in%c('USA','Kenya','Pakistan')) {
+        formula = as.formula(paste0(clus,"~ age_months+",var,"+age_months:",var))}
+      if (coun%in%c('Cambodia','Nicaragua')){
+    formula = as.formula(paste0(clus,"~ age_months+currently_breastfed+age_months:currently_breastfed+",var,"+age_months:",var,"+currently_breastfed:",var)) }
+      models[[paste(clus,var,coun)]] <- glm(formula, data = filter(data,country==coun), family = "gaussian") # Adjust family as needed
+    }
+  }
+  }
+  
+
+extract_glm_results <- function(model, model_name) {
+  tidy_model <- broom::tidy(model, conf.int = TRUE)
+  tidy_model$model <- model_name
+  return(tidy_model)
+}
+
+# Extract results for all models
+results_list <- lapply(names(models), function(model_name) {
+  extract_glm_results(models[[model_name]], model_name)
+})
+results_df <- do.call(rbind, results_list)%>%
+  separate(model,into=c('Outcome','Predictor','country'),sep=' ')%>%
+  group_by(Outcome)%>%
+  mutate(p.adjust=p.adjust(p.value,method='BH'))
+ 
+results_df
+```
+
+# S6.b) 
+```{r,fig.width=10}
+
+data=results_df%>%
+  mutate(country=factor(ifelse(country=='global','Global',country),levels=rev(c('Global','Cambodia','USA','Kenya','Nicaragua','Pakistan'))),
+         Outcome=factor(case_when(Outcome =='cluster9' ~ 'Early\nMicrobiome',
+                           Outcome=='cluster5' ~ 'Late\nMicrobiome',
+                           Outcome=='cluster1' ~ 'Transitional\nMicrobiome',
+                           Outcome=='richness_16S' ~ 'Microbiome Diversity\n(Richness)',
+                           Outcome=='Shannon_diversity' ~ 'Microbiome Diversity\n(Shannon)',
+                           TRUE ~ Outcome),levels=c('Microbiome Diversity\n(Richness)','Microbiome Diversity\n(Shannon)','Early\nMicrobiome','Transitional\nMicrobiome','Late\nMicrobiome')),
+         Predictor=ifelse(Predictor=='aMR','aFR',Predictor),
+         term=gsub('aMR','aFR',term),
+         significance=case_when(p.adjust<0.05~'p.adjust<0.05',
+                                p.value<0.05 ~ 'p.value <0.05',
+                                TRUE ~ 'NS'))%>%
+  mutate(term_clean=gsub('pMR_foods', 'pFR', gsub('age_months', 'Age (Months)', gsub('currently_breastfedYes', 'Breastfed',term))))
+data
+data%>%
+  subset(country!='Pakistan'&term=='aFR'&Outcome%in%c('Microbiome Diversity\n(Richness)','Microbiome Diversity\n(Shannon)','Early\nMicrobiome','Transitional\nMicrobiome','Late\nMicrobiome'))%>%
+ggplot(aes(y = country, x = estimate,color=significance)) +
+  geom_vline(xintercept = 0,linetype='dashed')+
+  geom_point(size=2) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.2) +
+  theme_bw() +
+  labs(title = "Animal Dietary Diversity",
+       x = "Coefficient (aFR)",
+       y = "",
+       color='Significance') +
+   geom_point() +
+  scale_color_manual(values=c('#5C5C5C',met.brewer('Hokusai3',3)[c(1,2)]))+
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.2) +
+  facet_grid(~Outcome,scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y=element_blank(),
+        legend.position = 'bottom',
+        panel.grid.minor.x = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",size=15,color='black'))
+ggsave('amr-vs-microbiome.png',
+       height=4,
+       width=10)
+```
+

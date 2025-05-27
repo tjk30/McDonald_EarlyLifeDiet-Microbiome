@@ -1,0 +1,273 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+library(conflicted)
+library(pheatmap)
+library(wesanderson)
+library(ggtreeExtra)
+library(ggtree)
+library(treeio)
+library(tidytree)
+library(ggstar)
+library(ggnewscale)
+library(TDbook)
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+
+parseGLMs=function(models) { 
+glm.results=data.frame(
+    term=character(0),
+    estimate=numeric(0),
+    std.error=numeric(0),
+    statistic=numeric(0),
+    p.value=numeric(0),
+    formula=character(0),
+    message=character(0) 
+  )
+    for (i in seq_along(models)) { 
+      output=models[[i]]
+  tidy_output=broom::tidy(output)
+  formula=formula(output)
+  tidy_output$formula=paste(deparse(formula),collapse='')
+  tidy_output
+  tidy_output$message=names(models[i])
+  glm.results=bind_rows(glm.results,tidy_output)
+    }
+return(glm.results)
+}
+
+```
+
+## Open data
+
+```{r}
+# file paths
+parent=getwd()
+
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+
+```
+# plot glms for batch effects
+
+```{r}
+# see: fig. 4 for how these files were generated
+data_renamed=read.csv('../Fig.4/cluster-df.csv',row.names = 1)
+data_all=read.csv('../Fig.4/pc.data.all.csv',row.names = 1) %>%
+  rownames_to_column()%>%
+  mutate(rowname=gsub('-|_| ','\\.',rowname))%>% # synchronize rownames for merging
+  column_to_rownames()%>%
+  merge(data_renamed,by=0,all.x=TRUE)%>%
+  column_to_rownames(var='Row.names')%>%
+  dplyr::rename(pFR=pMR_foods)
+
+
+models <- list()
+pc.data.all=data_all
+pc.data.all=pc.data.all%>%
+  mutate(diarrhea=case_when(diarrhea=="Don't Know" ~ NA,
+                            study=='SAGE'&is.na(diarrhea) ~ 'No',
+                            TRUE ~ diarrhea))
+
+```
+
+## nourish group
+```{r}
+pc.data.all$NOURISH_group=factor(pc.data.all$NOURISH_group)
+pc.data.all$NOURISH_group=relevel(pc.data.all$NOURISH_group,ref='Control')
+models[['nourish_group cluster5 Cambodia']]=glm(cluster5 ~ pFR+age_months+NOURISH_group+currently_breastfed,data=pc.data.all,family='gaussian')
+models[['nourish_group cluster1 Cambodia']]=glm(cluster1 ~ pFR+age_months+NOURISH_group+currently_breastfed,data=pc.data.all,family='gaussian')
+```
+
+```{r}
+pc.data.all$NOURISH_group_binary=ifelse(grepl('Nutrition',pc.data.all$NOURISH_group),'Yes','No')
+
+models[['NOURISH_group_binary cluster5 Cambodia']]=glm(cluster5 ~ pFR+age_months+NOURISH_group_binary+currently_breastfed,data=pc.data.all,family='gaussian')
+models[['NOURISH_group_binary cluster1 Cambodia']]=glm(cluster1 ~ pFR+age_months+NOURISH_group_binary+currently_breastfed,data=pc.data.all,family='gaussian')
+models[['nourish_group Shannon Cambodia']]=glm(Shannon_diversity ~ pFR+age_months+NOURISH_group+currently_breastfed,data=pc.data.all,family='gaussian')
+models[['NOURISH_group_binary Shannon Cambodia']]=glm(Shannon_diversity ~ pFR+age_months+NOURISH_group_binary+currently_breastfed,data=pc.data.all,family='gaussian')
+
+```
+## diarrhea
+```{r}
+models[['diarrhea Shannon global']]=glm(Shannon_diversity ~ pFR+age_months+diarrhea+country,data=pc.data.all,family='gaussian')
+models[['diarrhea cluster5 global']]=glm(cluster5 ~ pFR+age_months+diarrhea+country,data=pc.data.all,family='gaussian')
+models[['diarrhea cluster1 global']]=glm(cluster1 ~ pFR+age_months+diarrhea+country,data=pc.data.all,family='gaussian')
+models[['diarrhea cluster5 Cambodia']]=glm(cluster5 ~ pFR+age_months+currently_breastfed+diarrhea,data=filter(pc.data.all,country%in%c('Cambodia')),family='gaussian')
+models[['diarrhea cluster1 Cambodia']]=glm(cluster1 ~ pFR+age_months+currently_breastfed+diarrhea,data=filter(pc.data.all,country%in%c('Cambodia')),family='gaussian')
+models[['diarrhea Shannon Cambodia']]=glm(Shannon_diversity ~ pFR+age_months+currently_breastfed+diarrhea,data=filter(pc.data.all,country%in%c('Cambodia')),family='gaussian')
+
+```
+
+## whz
+```{r}
+models[['WHZ Shannon global']]=glm(Shannon_diversity ~ pFR+age_months+WHZ+country,data=pc.data.all,family='gaussian')
+models[['WHZ cluster5 global']]=glm(cluster5 ~ pFR+age_months+WHZ+country,data=pc.data.all,family='gaussian')
+models[['WHZ cluster5 Cambodia']]=glm(cluster5 ~ pFR+age_months+WHZ+currently_breastfed,data=filter(pc.data.all,country=='Cambodia'),family='gaussian')
+models[['WHZ cluster5 Kenya']]=
+glm(cluster5 ~ pFR+age_months+WHZ,data=filter(pc.data.all,country=='Kenya'),family='gaussian')
+models[['WHZ Shannon Cambodia']]=glm(Shannon_diversity ~ pFR+age_months+WHZ+currently_breastfed,data=filter(pc.data.all,country=='Cambodia'),family='gaussian')
+models[['WHZ Shannon Kenya']]=
+glm(Shannon_diversity ~ pFR+age_months+WHZ,data=filter(pc.data.all,country=='Kenya'),family='gaussian')
+
+```
+
+## rutf
+```{r}
+models[['RUTF cluster5 global']]=glm(cluster5 ~ pFR+age_months+received_nutrition_rutf,data=pc.data.all,family='gaussian')
+models[['RUTF cluster5 Kenya']]=glm(cluster5 ~ pFR+age_months+received_nutrition_rutf,data=filter(pc.data.all,country=='Kenya'),family='gaussian')
+models[['RUTF cluster5 Cambodia']]=glm(cluster5 ~ pFR+age_months+received_nutrition_rutf,data=filter(pc.data.all,country=='Cambodia'),family='gaussian')
+
+models[['RUTF Shannon global']]=glm(Shannon_diversity ~ pFR+age_months+received_nutrition_rutf,data=pc.data.all,family='gaussian')
+models[['RUTF Shannon Kenya']]=glm(Shannon_diversity ~ pFR+age_months+received_nutrition_rutf,data=filter(pc.data.all,country=='Kenya'),family='gaussian')
+models[['RUTF Shannon Cambodia']]=glm(Shannon_diversity ~ pFR+age_months+received_nutrition_rutf,data=filter(pc.data.all,country=='Cambodia'),family='gaussian')
+```
+
+```{r}
+extract_glm_results <- function(model, model_name) {
+  tidy_model <- broom::tidy(model, conf.int = TRUE)
+  tidy_model$model <- model_name
+  return(tidy_model)
+}
+
+
+# Extract results for all models
+results_list <- lapply(names(models), function(model_name) {
+  extract_glm_results(models[[model_name]], model_name)
+})
+```
+
+```{r}
+# Combine results into a single data frame
+results_df <- do.call(rbind, results_list)%>%
+  separate(model,into=c('Predictor','Outcome','country'),sep=' ')%>%
+  group_by(Outcome)%>%
+  mutate(p.adjust = p.adjust(p.value, method = "BH")) %>%
+  mutate(Predictor_clean=case_when(Predictor=='nourish_group' ~ 'Intervention Group',
+                                   Predictor=='NOURISH_group_binary' ~ 'Nutrition Intervention',
+                                   Predictor=='diarrhea' ~ 'Diarrhea',
+                                   Predictor=='WHZ' ~ 'Weight-for-height z score',
+                                   Predictor=='RUTF' ~ 'Ready to use therapeutic food',
+                                   Predictor=='pFR_rarefied' ~ 'pFR (Rarefied data)'),
+         term_clean=gsub('pFR', 'pFR', gsub('received_nutrition_rutfYes', 'Received RUTF', gsub('NOURISH_groupControl', 'Control Group', gsub('pFR_rarefied', 'pFR (Rarefied Data)', gsub('NOURISH_groupNutrition-only', 'Nutrition Group', gsub('NOURISH_groupSanitation-only', 'Sanitation Group', gsub('diarrheaYes', 'YesDiarrhea',  gsub('age_months', 'Age (Months)', gsub('currently_breastfedYes', 'Breastfed', gsub('NOURISH_group_binaryYes', 'Nutrition Intervention', gsub('NOURISH_groupCombined', 'Combined Group', term))))))))))))
+
+unique(results_df$term_clean)
+
+```
+
+## S4a-d) plot
+```{r}
+
+unique(results_df$Predictor_clean)
+for (predictor in unique(results_df$Predictor_clean)) { 
+# Plot the results
+plot=results_df%>%
+  subset(Predictor_clean==predictor)%>%
+  mutate(country=ifelse(country=='global','Global',country),
+         Outcome=case_when(Outcome =='cluster9' ~ 'Early\nMicrobiome',
+                           Outcome=='cluster5' ~ 'Late\nMicrobiome',
+                           Outcome=='cluster1' ~ 'Transitional\nMicrobiome',
+                           Outcome=='richness_16S' ~ 'Microbiome Diversity\n(Richness)',
+                           Outcome=='Shannon_diversity' ~ 'Microbiome Diversity\n(Shannon)',
+                            Outcome=='Shannon' ~ 'Microbiome Diversity\n(Shannon)',
+                           TRUE ~ Outcome))%>%
+  mutate(significance=case_when(p.adjust<0.05~'p.adjust<0.05',
+                                p.value<0.05 ~ 'p.value <0.05',
+                                TRUE ~ 'NS'),
+         country=factor(country,levels=c('Global','USA','Cambodia','Kenya','Nicaragua')))%>%
+  subset(!grepl('Intercept',term)#&estimate<25 # filter out any out of range values
+         )%>%
+  mutate(
+     Outcome=factor(Outcome,levels=c('Early\nMicrobiome','Transitional\nMicrobiome','Late\nMicrobiome','Microbiome Diversity\n(Richness)','Microbiome Diversity\n(Shannon)')),
+  term_clean = factor(term_clean, levels = rev(c(
+     "pFR",
+    "pFR (Rarefied Data)",
+    "Received RUTF",
+    "Control Group",
+    "Nutrition Group",
+    "Sanitation Group",
+    "Combined Group",
+    "YesDiarrhea",
+    "Nutrition Intervention",
+    "WHZ",
+    "(Intercept)",
+    "Age (Months)",
+    "Breastfed",
+    "countryUSA", "countryKenya", "countryPakistan", "countryNicaragua",
+    "Age (Months):Breastfed",
+    "Age (Months):pFR (Rarefied Data)",
+    "Breastfed:pFR (Rarefied Data)",
+    "Age (Months):countryUSA",
+    "Age (Months):countryKenya",
+    "Age (Months):countryPakistan",
+    "Age (Months):countryNicaragua",
+    "countryUSA:pFR (Rarefied Data)",
+    "countryKenya:pFR (Rarefied Data)",
+    "countryPakistan:pFR (Rarefied Data)",
+    "countryNicaragua:pFR (Rarefied Data)"
+  )))
+)%>%
+ggplot(aes(y = term_clean, x = estimate,color=significance)) +
+  geom_point() +
+  scale_color_manual(values=c('#5C5C5C',met.brewer('Hokusai3',3)[c(1,2)]))+
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.2) +
+  facet_grid(country~Outcome, scales = "free_y") +
+  theme_bw() +
+  labs(title = paste(predictor),
+       x = paste0("Coefficient (",predictor," model)"),
+       color='Significance') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y=element_blank(),
+        panel.grid.minor.x = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        legend.position = 'none',
+        text = element_text(family = "Arial",size=15,color='black'))+
+  geom_vline(xintercept = 0,linetype='dashed')+
+  xlim(-6,6)
+print(plot)
+if (predictor%in%c("Intervention Group","Nutrition Intervention")) {ggsave(paste0('confounders-glm-res-',predictor,'.png'),
+                                                                           height=3) } else {ggsave(paste0('confounders-glm-res-',predictor,'.png'))}
+
+  }
+
+```
+
+```{r}
+plot=results_df%>%
+  mutate(significance=case_when(p.adjust<0.05~'p.adjust<0.05',
+                                p.value<0.05 ~ 'p.value <0.05',
+                                TRUE ~ 'NS'))%>%
+ggplot(aes(y = term_clean, x = estimate,color=significance)) +
+  geom_point() +
+  scale_color_manual(values=c('#5C5C5C',met.brewer('Hokusai3',3)[c(1,2)]))+
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.2) +
+  facet_grid(country~Outcome, scales = "free_y") +
+  theme_bw() +
+  labs(color='Significance') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y=element_blank(),
+        panel.grid.minor.x = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",size=15,color='black'))+
+  geom_vline(xintercept = 0,linetype='dashed')
+print(plot)
+
+ggsave('significance-annotation.png')
+```
+
+

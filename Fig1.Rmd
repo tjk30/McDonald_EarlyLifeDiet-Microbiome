@@ -1,0 +1,565 @@
+---
+title: "Characterize global diet"
+output: html_notebook
+---
+
+# ***setup
+```{r}
+library(MetBrewer)
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+library(conflicted)
+library(paletteer)
+library(ShortRead)
+library(ggtreeExtra)
+library(ggtree)
+library(treeio)
+library(tidytree)
+library(ggstar)
+library(ggnewscale)
+library(TDbook)
+library(tidytext)
+conflicts_prefer(base::setdiff)
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::filter)
+hiroshige=c(met.brewer('Hiroshige')[c(1,4,6)],'#7DA4CA','#31475E')
+```
+
+## open data
+
+
+
+```{r}
+# file paths
+parent=getwd()
+# trnL
+ps.trnL=readRDS('FoodSeq-plant.rds')
+ps.infant=ps.trnL
+# 16S
+ps.16S=readRDS('Microbiome-16S.rds')
+
+# 12SV5
+ps.12sv5=readRDS('FoodSeq-animal.rds')
+
+
+```
+
+Total number of subjects
+```{r}
+n=ps.trnL@sam_data%>%
+  data.frame()%>%
+  .$subj%>%
+  unique()%>%
+  length()
+print(paste('total number of subjects in study:',n))
+```
+
+
+
+# ***Figure 1***
+```{r}
+samdf=ps.trnL@sam_data%>%
+  data.frame()
+
+samdf%>%
+  group_by(country)%>%
+  summarise(nSubjects=length(unique(subj)))
+```
+
+
+```{r}
+ps=ps.trnL%>%
+  prune_samples(sample_sums(.) > 0, .) %>% # Remove samples that do not have any food reads x
+  filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE) # Remove taxa from database with no reads
+assignments=data.frame(ps@tax_table)
+# To what label are assignments made?
+colSums(!is.na(assignments))/nrow(assignments)
+```
+Number of ASVs assigned to each taxonomic level:
+```{r}
+assignments=data.frame(ps@tax_table)
+length(assignments$superkingdom)
+
+assignments=data.frame(ps@tax_table)%>%
+  subset(!is.na(superkingdom))
+colSums(!is.na(assignments))
+```
+This is equivalent to 199 ASVs that matched something in the reference, of which, 113 were uniquely identified to the species level and 163 to the genus level.
+
+
+
+#### how many species does this potentially capture?
+```{r}
+# trnL reference database
+
+db <- readDNAStringSet('/Users/tjk30/Library/CloudStorage/Box-Box/project_davidlab/LAD_LAB_Personnel/Teresa_M/1_Infant-Metabarcoding/0_Methods/Reference/trnLGH_taxonomy.fasta') # Human foods database
+
+db.df <- 
+     data.frame(name = names(db),
+                seq = as.character(db)) |>
+     separate(name, 
+              into = c("superkingdom",
+                       "phylum",
+                       "class",
+                       "order",
+                       "family",
+                       "genus",
+                       "species",
+                       "subspecies",
+                       "varietas",
+                       "forma"),
+              sep = ';')
+
+```
+
+```{r}
+ps.filt=ps.trnL %>%
+ filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE) %>% # remove any foods that were not detected
+  subset_taxa(!is.na(superkingdom)) # remove ASVs not assigned to food database
+
+taxdf=ps.filt@tax_table %>%
+data.frame()%>%
+  mutate(foods=gsub(' ','_',species))
+taxdf%>%
+  subset(is.na(species)) # which ASVs were not assigned to species level
+```
+
+```{r}
+orphan.seqs=row.names(taxdf)[is.na(taxdf$species)] # ASVs not assigned to species level
+orphan.seqs.df=data.frame(CommonName=character(),
+                          species=character())
+extra.species=c()
+for (seq in orphan.seqs) {
+  matched_seqs=db.df$seq[grepl(seq,db.df$seq)]# check if subsequence in orphan sequences matches a full sequence in the human foods database
+  matched_species=unique(db.df$species[db.df$seq%in%matched_seqs]) # then save those species
+  if (length(matched_species>0)) {
+    extra.species=c(extra.species,gsub(' ','_',matched_species))
+    c=taxdf$CommonName[row.names(taxdf)==seq]
+    d=data.frame(CommonName=rep(c,length(matched_species)),
+                 species=matched_species)
+    orphan.seqs.df=bind_rows(orphan.seqs.df,d)
+    }
+}
+extra.species
+orphan.seqs.df=orphan.seqs.df%>%
+  mutate(food=gsub(' ','_',species)) 
+```
+
+
+```{r}
+seqs=taxdf[!is.na(taxdf$species),]
+seqs
+print('additional species found when including non-species level taxonomic assignment')
+length(base::setdiff(unique(orphan.seqs.df$species),unique(seqs$species)))  
+print('species duplicated in non-species-level assigned sequences')
+length(base::setdiff(unique(seqs$species),unique(orphan.seqs.df$species))) 
+all.species=unique(c(orphan.seqs.df$species,seqs$species))
+print('total number of unique species potentially captured by dataset')
+length(all.species) 
+```
+#### how many foods are shared?
+```{r}
+p=ps.trnL%>%
+  subset_taxa(!is.na(superkingdom))%>%
+  filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE)
+
+otu=data.frame(p@otu_table)
+
+otu$country=p@sam_data$country
+
+# Assign each food as 1 or 0 depending on whether it was detected in that country
+otu=otu%>%
+  rownames_to_column()%>%
+  pivot_longer(-c(rowname,country))%>%
+  mutate(value=ifelse(value>0,1,0))%>%
+  group_by(country,name)%>%
+  summarise(n=sum(value), # number of samples in that country with that food
+            percent=sum(value)/n()) # percent of samples in that country with food
+head(otu)
+```
+
+```{r}
+# use 2 thresholds: any reads, or detected in >1% samples of that country
+nCountries=otu%>%
+  mutate(any=ifelse(n>0,1,0),
+         onepercent=ifelse(percent>0.01,1,0))%>%
+  group_by(name)%>%
+  summarise(nCountries_anyDetected=sum(any),
+            nCountries_1percentcutoff=sum(onepercent))
+nCountries%>%
+  arrange(nCountries_anyDetected)
+```
+
+```{r}
+data=nCountries
+# Count for nCountries_anyDetected
+summary_anyDetected <- data %>%
+  dplyr::count(nCountries_anyDetected) %>%
+  complete(nCountries_anyDetected = 0:5, fill = list(n = 0))  # Ensure all values 0-5 are included
+
+# Count for nCountries_1percentcutoff
+summary_1percentcutoff <- data %>%
+  dplyr::count(nCountries_1percentcutoff) %>%
+  complete(nCountries_1percentcutoff = 0:5, fill = list(n = 0))  # Ensure all values 0-5 are included
+# Rename and merge
+summary_data <- summary_anyDetected %>%
+  dplyr::rename(Count_anyDetected = n) %>%
+  inner_join(summary_1percentcutoff %>% dplyr::rename(Count_1percentcutoff = n, Value = nCountries_1percentcutoff),
+             by = c("nCountries_anyDetected" = "Value")) %>%
+  select(
+    Value = nCountries_anyDetected,
+    Count_anyDetected,
+    Count_1percentcutoff
+  )
+
+# View the result
+print(summary_data)
+
+print(paste(sum(summary_data$Count_1percentcutoff[summary_data$Value>1]),'/',sum(summary_data$Count_1percentcutoff),' foods, or',100*(sum(summary_data$Count_1percentcutoff[summary_data$Value>1])/sum(summary_data$Count_1percentcutoff)), 'percent, had >1% prevalence in >1 country'))
+
+print(paste(sum(summary_data$Count_1percentcutoff[summary_data$Value==1]),'/',sum(summary_data$Count_1percentcutoff),' foods, or',100*(sum(summary_data$Count_1percentcutoff[summary_data$Value==1])/sum(summary_data$Count_1percentcutoff)), 'percent, had >1% prevalence in only 1 country'))
+summary_data%>%
+  pivot_longer(-Value)%>%
+  mutate(percent=(value/207)*100)%>%
+  select(-value)%>%
+  pivot_wider(names_from = 'name',values_from = 'percent')
+```
+38% of ASVs were only detected in 1 country. 
+
+
+
+
+
+## food distribution metrics
+```{r}
+d=p@sam_data%>%
+  data.frame()%>%
+  select(country)
+d
+
+prevalence.df=data.frame(p@otu_table)%>%
+  merge(d,by=0)%>%
+  select(-Row.names)%>%
+  pivot_longer(-country,names_to = 'name',values_to = 'reads')%>%
+  group_by(name,country)%>%
+  summarise(Prevalence=sum(reads>0)/length(reads))
+prevalence.df
+
+df=prevalence.df%>%
+  group_by(country)%>%
+  mutate(five=ifelse(Prevalence>=0.05,1,0))%>%
+  group_by(name)%>%
+  summarise(nCountries_5percentcutoff=sum(five))%>%
+  dplyr::count(nCountries_5percentcutoff) 
+
+df
+
+print(paste(df$n[df$nCountries_5percentcutoff==5], 'out of', sum(df$n),'foods were detected with at least 5% prevalence in all countries.'))
+```
+### what were the 8 prevalent foods?
+```{r}
+topFoods=prevalence.df%>%
+  group_by(country)%>%
+  mutate(five=ifelse(Prevalence>=0.05,1,0))%>%
+  group_by(name)%>%
+  summarise(nCountries_5percentcutoff=sum(five))%>%
+  subset(nCountries_5percentcutoff>4)%>%
+  .$name
+topFoods
+incommon=prevalence.df%>%
+  left_join(taxdf%>%
+  select(CommonName)%>%
+  rownames_to_column(var='name'),by='name')%>%
+  subset(name%in%topFoods)%>%
+  .$CommonName%>%
+  unique()
+incommon
+```
+# 12SV5 stats
+How many infant samples had non-human animal DNA, and how many had multiple species detected. 
+```{r}
+data=ps.trnL@sam_data%>%
+  data.frame()
+ps=ps.12sv5%>%
+   subset_taxa(., species!='Homo sapiens') 
+ps@sam_data$aFR=ifelse(ps@otu_table>0,1,0) %>%  # count food if >0 reads
+  rowSums()
+
+aFR=ps@sam_data%>%
+  data.frame()%>%
+  select(aFR)
+aFR
+
+data=data%>%
+  merge(aFR,by=0,all.x=TRUE)
+
+data=data%>%
+  group_by(aFR)%>%
+  summarise(n=n())%>%
+  mutate(greater1=ifelse(aFR>1,'yes','no'))%>%
+  group_by(greater1)%>%
+  summarise(n=sum(n))
+yes=data$n[data$greater1=='yes'][!is.na(data$n[data$greater1=='yes'])]
+print(paste0(round(100*yes/sum(data$n,na.rm=TRUE)),'% samples had more than 1 animal food detected'))
+```
+
+
+# Figures
+## a) trnL+12sv5 tree
+
+
+```{r}
+
+ps=ps.trnL%>%
+  filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE)%>%
+  subset_taxa(!is.na(superkingdom))# foods only
+taxdf=data.frame(ps.trnL@tax_table)
+otu.df<-ps@otu_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "Sample") %>%
+  pivot_longer(-c(Sample),names_to='asv',values_to='reads') %>%
+  merge(taxdf%>%select(food),by.x='asv',by.y=0,all.x=TRUE) %>%
+  dplyr::select(Sample,reads,food) %>%
+  subset(!is.na(food))  %>%
+  mutate(present=ifelse(reads>0,1,0)) %>%
+  left_join(data.frame(ps@sam_data)%>%select(country)%>%rownames_to_column(var = "Sample"))
+
+```
+```{r}
+
+taxdf=data.frame(ps.12sv5@tax_table)
+otu.df.12s<-ps.12sv5@otu_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "Sample") %>%
+  pivot_longer(-c(Sample),names_to='asv',values_to='reads') %>%
+  merge(taxdf%>%select(food),by.x='asv',by.y=0,all.x=TRUE) %>%
+  dplyr::select(Sample,reads,food) %>%
+  subset(!is.na(food))  %>%
+  mutate(present=ifelse(reads>0,1,0)) %>%
+  left_join(data.frame(ps@sam_data)%>%select(country)%>%rownames_to_column(var = "Sample"))
+otu.df.12s
+```
+
+```{r}
+missing=setdiff(sample_names(ps.trnL),sample_names(ps.12sv5)) # identify samples that didn't successfully sequence for 12sv5
+food=unique(otu.df.12s$food)
+dummy12s=crossing(missing,food)%>%
+  dplyr::rename(Sample=missing)%>%
+  mutate(reads=0,
+         present=0)%>%
+  left_join(data.frame(ps@sam_data)%>%select(country)%>%rownames_to_column(var = "Sample"))
+
+```
+
+
+```{r}
+otu.df.percent<-otu.df %>%
+  bind_rows(otu.df.12s)%>% # add 12S data
+  bind_rows(dummy12s) %>% # add back samples with missing 12s data so sample numbers between 12s, trnL line up
+  group_by(country,food) %>%
+  summarise(percent=100*(sum(present)/length(present))) # get prevalences for each food 
+otu.df.percent
+```
+
+
+```{r}
+# **********Clustering***********
+df=otu.df.percent%>%
+  pivot_wider(names_from = 'country',values_from = 'percent')%>%
+  mutate(across(c(Cambodia,Kenya,Nicaragua,USA,Pakistan),~as.numeric(paste(.))))%>%
+  column_to_rownames(var='food')
+df
+
+dist_matrix <- dist(df) 
+hc <- hclust(dist_matrix, method = "complete")
+plot(hc)
+
+# ******Annotation data**********
+dat2_me=otu.df.percent%>%
+  dplyr::rename(Country=country,
+                Prevalence=percent)%>%
+  mutate(Prevalence_percentile=rank(Prevalence)/length(Prevalence)) %>%
+  mutate(Prevalence_percentile=ifelse(Prevalence==0,0,Prevalence_percentile)) # set all 0s to 0 (using ranking means some 0s get ranked >0)
+
+specific_values <- c(0, 1, 5, 10, 20) # percent cutoffs for plotting
+interpolated_percentiles <- approx(x = dat2_me$Prevalence, y = dat2_me$Prevalence_percentile, xout = specific_values, method = "linear")
+
+# Show results
+interpolated_results <- data.frame(
+  Prevalence = specific_values,
+  Interpolated_Percentile = interpolated_percentiles$y
+)
+
+interpolated_results
+breaks=interpolated_results$Interpolated_Percentile
+breaks
+labels=paste0(interpolated_results$Prevalence,'%')
+labels[2]='<1%'
+# *******Tree*********
+phylotree=as.phylo(hc)
+tree=ggtree(hc,
+       layout='circular',
+       branch.length = 'none')
+
+```
+
+
+```{r}
+rarefoods=otu.df.percent%>%
+  pivot_wider(names_from='country',values_from = 'percent')%>%
+  group_by(food)%>%
+  summarise(max=max(Cambodia,Kenya,Nicaragua,Pakistan,USA))%>%
+  subset(max<1)%>%
+  .$food
+
+pruned_tree <- drop.tip(phylotree, tip = rarefoods)
+tree <- ggtree(pruned_tree,
+               layout='circular',
+       branch.length = 'none')
+dat2_me <- dat2_me %>% filter(food %in% pruned_tree$tip.label)
+tips_to_label=str_to_title(tree$data$label)
+top8=data.frame(ps.trnL@tax_table)%>%
+  subset(row.names(.)%in%topFoods)%>%
+  .$food
+bold_labels=c(top8,
+                'Bovidae (Cow)',
+                'Poultry (Chicken)'
+                )
+
+# Define font face: bold for important labels, plain otherwise
+tree$data$label_face <- ifelse(tree$data$label %in% bold_labels, "bold", "plain")
+
+# Create the plot
+plot <- tree +
+  geom_fruit(
+    data = dat2_me, 
+    geom = geom_tile,
+    mapping = aes(y = food, x = Country, alpha = Prevalence_percentile, fill = Country),
+    color = "grey50", offset = 0.02, size = 0.02
+  ) +
+  scale_alpha_continuous(
+    range = c(0, 1),
+    breaks = breaks,
+    labels = labels,
+    name = 'Food prevalence'
+  ) +
+  scale_fill_manual(values = hiroshige) +
+
+  geom_tiplab(
+    aes(label = label, fontface = label_face),
+    nudge_x = 7,
+    size = 3.2
+  ) +
+  
+  scale_color_identity() + 
+  guides(
+  color = guide_legend(
+    override.aes = list(size = 5)  # size of points in the legend
+  ))+
+  theme(
+    legend.position = 'bottom',
+     legend.box = "vertical",
+    legend.spacing = unit(0, "cm"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    text=element_text(family='Arial')
+  ) +
+  
+  xlim(0, 45)
+
+plot
+ggsave('Fig.1A.png',
+       height=10,
+       width=10
+       )
+```
+
+
+
+## b) top foods by country
+
+
+
+
+```{r,fig.height=10}
+
+ps=ps.trnL %>% 
+  filter_taxa(function(x) sum(x > 0) > 0, prune = TRUE) %>%
+  subset_taxa(.,!is.na(superkingdom))
+ps
+ps.comb=ps.12sv5%>% 
+  subset_taxa(., species!='Homo sapiens') %>%
+  merge_phyloseq(ps)
+tax_table(ps.comb)=as.matrix(data.frame(ps.comb@tax_table)[,c("species","food")])
+taxdf=data.frame(ps.comb@tax_table)
+
+melty=ps.comb@otu_table%>%
+  data.frame()%>%
+  rownames_to_column()%>%
+  pivot_longer(-rowname,values_to = 'Abundance',names_to = 'asv')%>%
+  merge(taxdf,by.x='asv',by.y=0)%>%
+  merge(data.frame(ps.comb@sam_data)%>%select(country),by.x='rowname',by.y=0)
+
+head(melty)
+
+top10foods=melty%>%
+  subset(!is.na(country))%>%
+  mutate(Present=ifelse(Abundance>0,1,0))%>%
+  group_by(country,food,species)%>%
+  summarise(nDetected=sum(Present),
+            Percent=(sum(Present)/length(asv))*100)%>%
+  group_by(country)%>%
+  slice_max(Percent,n=5)%>% # top 10 foods
+  mutate(food=str_to_title(food))
+
+top10foods.global <-melty %>%
+  filter(!is.na(country)) %>%
+  mutate(Present = ifelse(Abundance > 0, 1, 0)) %>%
+  group_by(food, species) %>%
+  summarise(nDetected = sum(Present),
+            Percent = (sum(Present) / n()) * 100,
+            .groups = "drop") %>%
+  arrange(desc(Percent)) %>%
+  slice_max(Percent, n = 5, with_ties = FALSE) %>%
+  mutate(food = str_to_title(food))%>%
+  mutate(country='Global')
+
+
+top10foods.global
+top10foods
+data=bind_rows(top10foods,top10foods.global)
+
+data
+```
+
+
+```{r,fig.height=10}
+plot=data%>%
+  mutate(Percent=Percent/100,
+         name = reorder_within(food, Percent, country),
+         country_ann=ifelse(country=='Global',NA,country),
+         country = factor(country, levels = c("Global", setdiff(unique(country), "Global")))) %>% 
+  ggplot(aes(y=name,x=Percent,fill=country_ann
+             ))  +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Samples with Food", y = "") +
+   facet_wrap(~country,scales='free_y',ncol=1) + 
+  scale_y_reordered() +scale_fill_manual(values=hiroshige)+theme_bw()+ 
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1))+
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+        legend.position = 'none',
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white"),
+        text = element_text(family = "Arial",size=12,color='black'))
+plot
+ggsave('Top10Foods-byCountry-vertical.png',
+       height=7,
+       width=3.5)
+```
+
+
+
